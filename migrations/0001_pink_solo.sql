@@ -1,0 +1,2 @@
+ALTER TABLE "questions" ADD COLUMN "skill_category" text;--> statement-breakpoint
+ALTER TABLE "questions" ADD CONSTRAINT "questions_skill_category_check" CHECK ("questions"."skill_category" in ('vocabulary', 'grammar', 'reading', 'listening', 'writing', 'speaking', 'pronunciation'));

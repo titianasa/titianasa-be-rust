@@ -1,0 +1,70 @@
+[package]
+name = "titian-backend-rust"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "titian-backend-rust"
+path = "src/main.rs"
+
+[dependencies]
+# Web framework
+axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.6", features = ["cors", "trace", "request-id", "util"] }
+
+# Database
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Auth & crypto
+jsonwebtoken = "9"
+sha2 = "0.10"
+rand = { version = "0.8", features = ["getrandom"] }
+base64 = "0.22"
+
+# HTTP client (Google JWKS fetch; OpenRouter chat/STT/TTS; Google Meet API)
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "multipart"], default-features = false }
+
+# Utils
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "1"
+dotenvy = "0.15"
+async-trait = "0.1"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# R2 (S3-compatible) object storage for Drive/assets (R9)
+aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }
+
+# Redis (P1-012 deferral closed) — client only, connections opened
+# per-use via get_multiplexed_tokio_connection() rather than a shared
+# ConnectionManager, since Client::open() is sync (no network I/O at
+# AppState::init() time) and nothing depends on a pre-warmed connection
+# yet. Mirrors parelabs-backend's redis crate choice/version.
+redis = { version = "0.24", features = ["tokio-comp"] }
+
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"
+
+# Full debug info (the default `debug = true`) is what actually blows up
+# target/ — each of the ~9 integration-test files in tests/ links its own
+# complete debug binary (axum+tokio+sqlx+reqwest+rustls, statically),
+# and full DWARF debuginfo multiplies that many times over. Panic
+# messages/backtraces stay perfectly readable with only line-table info
+# (file:line, no full variable/type debug data) — this is not a
+# release-mode change, dev builds stay fast and unoptimized.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"

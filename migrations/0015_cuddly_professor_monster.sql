@@ -1,0 +1,2 @@
+ALTER TABLE "enrollments" ADD COLUMN "cancelled_by" text;--> statement-breakpoint
+ALTER TABLE "enrollments" ADD CONSTRAINT "enrollments_cancelled_by_check" CHECK ("enrollments"."cancelled_by" in ('student', 'tutor'));
