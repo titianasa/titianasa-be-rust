@@ -1,3 +1,4 @@
+pub mod learning_profile;
 pub mod ai;
 pub mod assessment;
 pub mod attendance;
@@ -9,6 +10,7 @@ pub mod learning;
 pub mod marketplace;
 pub mod messaging;
 pub mod module;
+pub mod org_class;
 pub mod organization;
 pub mod proctoring;
 pub mod program;
@@ -18,6 +20,7 @@ pub mod speaking_room;
 use axum::{http::Method, middleware::from_fn_with_state, routing::get, Router};
 use std::sync::Arc;
 use tower_http::{
+    compression::CompressionLayer,
     cors::{AllowHeaders, AllowOrigin, CorsLayer},
     trace::TraceLayer,
 };
@@ -38,7 +41,7 @@ use crate::state::AppState;
 pub fn create_router(state: Arc<AppState>) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::exact(state.config.frontend_origin.parse().unwrap()))
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::PATCH, Method::DELETE])
         .allow_headers(AllowHeaders::list([
             axum::http::header::CONTENT_TYPE,
             axum::http::header::AUTHORIZATION,
@@ -50,12 +53,14 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .merge(auth::protected_routes())
         .merge(organization::protected_routes())
         .merge(module::protected_routes())
+        .merge(org_class::protected_routes())
         .merge(program::protected_routes())
         .merge(question::protected_routes())
         .merge(assessment::protected_routes())
         .merge(learning::protected_routes())
         .merge(gamification::protected_routes())
         .merge(economy::protected_routes())
+        .merge(learning_profile::protected_routes())
         .merge(marketplace::protected_routes())
         .merge(attendance::protected_routes())
         .merge(speaking_room::protected_routes())
@@ -69,6 +74,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .merge(auth::public_routes())
         .merge(marketplace::public_routes())
         .merge(messaging::public_routes())
+        .merge(module::public_routes())
         .merge(protected)
         // A live Bun-vs-Rust regression pass found axum's own default
         // 404 (an empty body, no content-type) on any unmatched
@@ -82,6 +88,11 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // the documented quirks elsewhere in this port.
         .fallback(crate::handlers::health::not_found)
         .layer(cors)
+        // Curriculum responses are large, deeply repetitive JSON — the
+        // learning-path browser alone is ~440 KB uncompressed. Most of
+        // this app's users are on metered mobile data, so compress
+        // everything rather than special-casing one endpoint.
+        .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

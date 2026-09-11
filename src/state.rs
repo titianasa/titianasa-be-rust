@@ -6,6 +6,7 @@ use sqlx::PgPool;
 use crate::config::Config;
 use crate::services::ai_provider::AIProvider;
 use crate::services::canvas_hub::CanvasHub;
+use crate::services::collab_hub::CollabHub;
 use crate::services::google_oauth::GoogleTokenVerifier;
 use crate::services::meeting_provider::MeetingProvider;
 use crate::services::payment_provider::PaymentProvider;
@@ -23,6 +24,7 @@ pub struct AppState {
     pub meeting_provider: Arc<dyn MeetingProvider>,
     pub storage: Arc<dyn AssetStorage>,
     pub canvas_hub: Arc<CanvasHub>,
+    pub collab_hub: Arc<CollabHub>,
 }
 
 impl AppState {
@@ -74,6 +76,7 @@ impl AppState {
             meeting_provider,
             storage,
             canvas_hub: Arc::new(CanvasHub::new()),
+            collab_hub: Arc::new(CollabHub::new()),
             config,
         })
     }

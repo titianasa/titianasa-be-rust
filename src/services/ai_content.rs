@@ -39,55 +39,148 @@ pub struct LessonGenerationBlueprint {
     pub grammar_target: Option<String>,
     pub vocab_target: Vec<String>,
     pub concept_ids: Vec<Uuid>,
+    // Migration 0043 — author THIS item under a different subject than
+    // the module's; shapes both the prompt (which subject to write for)
+    // and the created item's own subject_id.
+    pub subject_id: Option<Uuid>,
 }
 
-fn lesson_generation_prompt(bp: &LessonGenerationBlueprint) -> (String, String) {
-    let mut system = String::from(
-        "You are an ALR curriculum content generator. Output ONLY ALR Learning Markdown \
-(ALM) content — no prose outside the lesson, no markdown code fences around the \
-whole output. Use \"# \"/\"## \" headings and \"> \" blockquotes for single-line \
-examples for most of the lesson.\n\n\
-You may ALSO use \":::type\\nkey: value\\n:::\" directive blocks, but ONLY the \
-text-only types below, each with EXACTLY these keys, no others — every directive \
-line must be \"key: value\", never a bare line with no key:\n\
+// Subjects whose material is another LANGUAGE (as opposed to being
+// taught, like every other subject, IN Indonesian). Grammar-lesson
+// framing and the language-teaching ALM directives only make sense for
+// these — asking the model to write a Matematika or Sejarah lesson
+// under "this is a GRAMMAR lesson" instructions produced nonsense
+// before this fix.
+fn is_language_subject(subject_name: &str) -> bool {
+    matches!(subject_name, "English" | "Bahasa Arab" | "Bahasa Asing" | "Bahasa Indonesia")
+}
+
+// Of those, the ones where "think in the target language vs Indonesian"
+// is a meaningful contrast — not Bahasa Indonesia itself, which IS the
+// language of instruction everywhere else.
+fn is_foreign_language_subject(subject_name: &str) -> bool {
+    matches!(subject_name, "English" | "Bahasa Arab" | "Bahasa Asing")
+}
+
+// Subjects where formulas/equations genuinely appear — LaTeX is worth
+// mentioning in the prompt for these, and noise for e.g. Sejarah.
+fn is_formula_subject(subject_name: &str) -> bool {
+    matches!(
+        subject_name,
+        "Matematika" | "Fisika" | "Kimia" | "Biologi" | "IPA" | "IPAS" | "Informatika"
+            | "Akuntansi" | "Ekonomi" | "Penalaran & Logika"
+    )
+}
+
+fn lesson_generation_prompt(bp: &LessonGenerationBlueprint, subject_name: &str) -> (String, String) {
+    let language = is_language_subject(subject_name);
+    let foreign_language = is_foreign_language_subject(subject_name);
+    let formula = is_formula_subject(subject_name);
+
+    // A flashcard/common_trap example pair suited to what's actually
+    // being taught — a foreign-language translation pair makes no
+    // sense for Matematika, and a math-flavoured example makes no
+    // sense for English, so this varies by subject family.
+    let (flashcard_front, flashcard_back, trap_term, trap_explanation): (&str, &str, &str, &str) = if foreign_language {
+        ("go", "went", "actual", "means real/genuine in English, not \"aktual\" (current/topical)")
+    } else if language {
+        (
+            "kalimat efektif",
+            "kalimat yang lugas, jelas, dan tidak bertele-tele",
+            "di mana",
+            "kata depan (dua kata) — berbeda dari \"dimana\" (kata tanya, satu kata) yang sering tertukar",
+        )
+    } else {
+        ("istilah kunci mata pelajaran ini", "definisi singkatnya", "miskonsepsi umum siswa", "penjelasan singkat kenapa itu keliru")
+    };
+
+    let mut system = format!(
+        "You are an ALR curriculum content generator, writing a lesson for the subject \"{subject_name}\" \
+in the Indonesian K-12/tertiary curriculum. Output ONLY ALR Learning Markdown (ALM) content \
+— no prose outside the lesson, no markdown code fences around the whole output. Use \"# \"/\"## \" \
+headings and \"> \" blockquotes for single-line examples for most of the lesson. Write the \
+lesson itself in Indonesian, the language every other subject on this platform is taught in \
+(quote target-language examples verbatim where the topic calls for them).\n\n\
+You may ALSO use \":::type\\nkey: value\\n:::\" directive blocks, but ONLY the text-only types \
+below, each with EXACTLY these keys, no others — every directive line must be \"key: value\", \
+never a bare line with no key:\n\
 :::flashcard\n\
-front: go\n\
-back: went\n\
-:::\n\
-:::indonesian_learner_alert\n\
-text: Indonesian doesn't mark tense with a verb change like this.\n\
+front: {flashcard_front}\n\
+back: {flashcard_back}\n\
 :::\n\
 :::common_trap\n\
-term: actual\n\
-explanation: means real/genuine in English, not \"aktual\" (current/topical).\n\
-:::\n\
-:::think_in_english\n\
-indonesian_pattern: Saya sudah makan (kata kerja tidak berubah)\n\
-english_pattern: I have eaten (verb changes to \"have + V3\")\n\
-:::\n\n\
-Do NOT use audio/video/image/question_embed directives — you have no real \
-asset or question ids to reference, so any use of them will be invalid. Every \
-directive above is optional; when in doubt, prefer plain headings/paragraphs/\
-blockquotes instead of a directive.",
+term: {trap_term}\n\
+explanation: {trap_explanation}\n\
+:::\n"
     );
 
-    if bp.grammar_target.is_some() {
+    if language {
         system.push_str(
-            "\n\nThis is a GRAMMAR lesson. It MUST contain a heading for every one of the \
+            ":::indonesian_learner_alert\n\
+text: A specific mistake Indonesian learners of this subject commonly make, and why.\n\
+:::\n",
+        );
+    }
+    if foreign_language {
+        system.push_str(&format!(
+            ":::think_in_english\n\
+indonesian_pattern: contoh pola berpikir dalam Bahasa Indonesia\n\
+english_pattern: the equivalent pattern in {subject_name}\n\
+:::\n"
+        ));
+    }
+
+    if formula {
+        system.push_str(&format!(
+            "\n\nThis subject uses mathematical notation. Write any formula, equation, or \
+symbolic expression as LaTeX inside a plain paragraph or heading — inline as \
+$...$ (e.g. \"turunan dari $x^2$ adalah $2x$\") or, for a standalone equation on its \
+own line, display math as $$...$$ (e.g. $$\\int_0^1 x^2\\,dx = \\frac{{1}}{{3}}$$). This is \
+plain text, not a directive — do not wrap it in a :::type block. Prefer this over ASCII \
+approximations (\"x^2\" or \"sqrt(x)\") every time an actual formula appears, since {subject_name} \
+content is unreadable without properly typeset notation."
+        ));
+    }
+
+    if foreign_language || subject_name == "Bahasa Indonesia" {
+        system.push_str(&format!(
+            "\n\nWrite any {subject_name} example, phrase, or vocabulary item in its own actual \
+script — Arabic script for Bahasa Arab, Hanzi/Pinyin for Mandarin, Hangul for Korean, Kana/\
+Kanji for Japanese, and so on, matching whichever language this topic is actually about. \
+Never transliterate into Latin letters as a substitute for the real script; give a Latin \
+transliteration or Indonesian gloss ALONGSIDE the original script, not instead of it."
+        ));
+    }
+
+    system.push_str(
+        "\nDo NOT use audio/video/image/question_embed directives — you have no real \
+asset or question ids to reference, so any use of them will be invalid. Every directive \
+above is optional; when in doubt, prefer plain headings/paragraphs/blockquotes instead \
+of a directive.",
+    );
+
+    if language {
+        if let Some(_grammar_target) = &bp.grammar_target {
+            system.push_str(
+                "\n\nThis is a GRAMMAR lesson. It MUST contain a heading for every one of the \
 following 11 sections, in order, each heading's text starting with the exact \
 numeric prefix shown (e.g. a heading literally starting with \"01 — \"):\n",
-        );
-        for (prefix, title) in curriculum_constitution::SECTIONS {
-            system.push_str(&format!("{prefix} — {title}\n"));
+            );
+            for (prefix, title) in curriculum_constitution::SECTIONS {
+                system.push_str(&format!("{prefix} — {title}\n"));
+            }
         }
     }
 
-    let mut user = format!("Topic: {}\nLesson type: {}\n", bp.topic, bp.content_type);
-    if let Some(grammar_target) = &bp.grammar_target {
-        user.push_str(&format!("Grammar target: {grammar_target}\n"));
+    let mut user = format!("Subject: {subject_name}\nTopic: {}\nLesson type: {}\n", bp.topic, bp.content_type);
+    if language {
+        if let Some(grammar_target) = &bp.grammar_target {
+            user.push_str(&format!("Grammar target: {grammar_target}\n"));
+        }
     }
     if !bp.vocab_target.is_empty() {
-        user.push_str(&format!("Vocabulary target: {}\n", bp.vocab_target.join(", ")));
+        let label = if language { "Vocabulary target" } else { "Istilah kunci (key terms) to cover" };
+        user.push_str(&format!("{label}: {}\n", bp.vocab_target.join(", ")));
     }
 
     (system, user)
@@ -112,7 +205,30 @@ async fn record_lesson_generation_failed(pool: &PgPool, ai_task_id: Uuid, user_i
 pub async fn generate_lesson(pool: &PgPool, ctx: &AuthContext, ai: &dyn AIProvider, model: &str, bp: LessonGenerationBlueprint) -> Result<GenerateLessonResponse, AppError> {
     require_permission(ctx, Resource::ModuleItem, Action::Create)?;
 
-    let (system_prompt, user_prompt) = lesson_generation_prompt(&bp);
+    // The prompt is shaped by which subject this module actually belongs
+    // to (Matematika vs English vs Sejarah, ...) — falls back to a
+    // neutral label rather than failing outright, since a folder module
+    // has no subject_id of its own.
+    // The item's own subject_id wins when set (this generated item is
+    // being authored for a DIFFERENT subject than its module's) — same
+    // "override beats inherited" precedence module_item::update_subject
+    // and item-editor-pane.tsx's effective-subject resolution both use.
+    let effective_subject_id = match bp.subject_id {
+        Some(id) => Some(id),
+        None => sqlx::query_scalar!(r#"select subject_id from modules where id = $1"#, bp.module_id)
+            .fetch_optional(pool)
+            .await?
+            .flatten(),
+    };
+    let subject_name = match effective_subject_id {
+        Some(id) => sqlx::query_scalar!(r#"select name from subjects where id = $1"#, id)
+            .fetch_optional(pool)
+            .await?
+            .unwrap_or_else(|| "materi umum".to_string()),
+        None => "materi umum".to_string(),
+    };
+
+    let (system_prompt, user_prompt) = lesson_generation_prompt(&bp, &subject_name);
     let max_tokens = resolve_max_tokens(model, 2048).await;
     let request = GenerationRequest { model: model.to_string(), system_prompt, user_prompt, temperature: 0.4, max_tokens, image_url: None, json_mode: false };
 
@@ -171,6 +287,16 @@ pub async fn generate_lesson(pool: &PgPool, ctx: &AuthContext, ai: &dyn AIProvid
         content: Some(alm),
         format: Some("markdown".to_string()),
         concept_ids: Some(bp.concept_ids),
+        // This path only ever generates "article" content (ALM prose,
+        // parsed straight into content_blocks) — quiz generation is a
+        // separate flow producing a quiz_config JSON, not ALM.
+        quiz_config: None,
+        // The raw override, not effective_subject_id — a plain None
+        // here correctly means "inherit the module's", same as manual
+        // item creation; storing a redundant copy of the module's own
+        // subject_id on every item would make module_item::update_subject's
+        // "None = inherit" contract ambiguous with "None = never checked".
+        subject_id: bp.subject_id,
     };
     let item = module_item::create_with_provenance(pool, ctx, bp.module_id, new_item, "ai").await?;
 
@@ -183,8 +309,8 @@ pub async fn generate_lesson(pool: &PgPool, ctx: &AuthContext, ai: &dyn AIProvid
 
 pub struct QuestionGenerationBlueprint {
     pub bank_id: Uuid,
-    // Must be a type registered in question_schema's registry — mcq/
-    // fill_blank/matching at time of writing.
+    // Must be a type registered in question_schema's registry —
+    // multiple_choice/gap_fill/matching at time of writing.
     pub question_type: String,
     pub topic: String,
     pub count: i64,

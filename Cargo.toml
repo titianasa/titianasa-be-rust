@@ -12,7 +12,7 @@ path = "src/main.rs"
 axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.4"
-tower-http = { version = "0.6", features = ["cors", "trace", "request-id", "util"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "request-id", "util", "compression-gzip", "compression-br"] }
 
 # Database
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
@@ -51,6 +51,27 @@ aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }
 # AppState::init() time) and nothing depends on a pre-warmed connection
 # yet. Mirrors parelabs-backend's redis crate choice/version.
 redis = { version = "0.24", features = ["tokio-comp"] }
+
+# Phase 31 (P31-005) — real-time collaborative editing (module_items).
+# yrs is the Rust port of the Yjs CRDT; yrs-axum wires its y-sync wire
+# protocol (doc updates + awareness/cursor state) onto an Axum
+# WebSocket — this is why M0 upgraded the whole backend to axum 0.8
+# (yrs-axum 0.8.x is the only version line published, and it requires
+# axum 0.8). The sync protocol (Message/Protocol/Awareness) lives in
+# yrs::sync directly as of this yrs line — no separate y-sync crate
+# dependency needed. yrs is pinned to EXACTLY yrs-axum's own pin
+# (verified via its Cargo.toml — "0.18.2", not the newer 0.27 line
+# that's latest on crates.io): Cargo would otherwise happily resolve
+# two different yrs major versions side by side, and their same-named
+# types (Awareness, Doc, ...) are NOT interchangeable across versions.
+yrs = "=0.18.8"
+yrs-axum = "0.8"
+futures-util = "0.3"
+
+# Text out of PDF/Word attachments for the AI composers ("Lampiran").
+pdf-extract = "0.7"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+quick-xml = "0.31"
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }

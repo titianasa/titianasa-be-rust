@@ -70,6 +70,19 @@ pub async fn run_item_qa(pool: &PgPool, item_id: Uuid) -> Result<QaReport, AppEr
         }
     }
 
+    // Phase 37 — a `quiz` item's question_groups are allowed to be
+    // incomplete while drafting (module_item::update_quiz_config only
+    // enforces structure, not full field correctness — see
+    // quiz_config_schema.rs's header). Full correctness is surfaced
+    // HERE instead, same non-blocking "gerbang manusia" contract as
+    // every other QA check in this file.
+    let quiz_config = sqlx::query_scalar!(r#"select quiz_config from module_items where id = $1"#, item_id).fetch_optional(pool).await?.flatten();
+    if let Some(quiz_config) = quiz_config {
+        for message in crate::services::quiz_config_schema::find_issues(&quiz_config) {
+            issues.push(QaIssue { category: "quiz_config".to_string(), message });
+        }
+    }
+
     Ok(from_issues(issues))
 }
 

@@ -162,10 +162,20 @@ pub async fn create_session(pool: &PgPool, ctx: &AuthContext, conversation_id: U
         return Err(AppError::Forbidden);
     }
 
-    let content_type = sqlx::query_scalar!(r#"select content_type from module_items where id = $1"#, item_id).fetch_optional(pool).await?;
-    let Some(content_type) = content_type else { return Err(AppError::NotFound("module_item_not_found")) };
-    if content_type.as_deref() != Some("writing") {
-        return Err(AppError::UnprocessableEntity("not_a_writing_item", "canvas sessions are only for content_type='writing' module items".to_string()));
+    // Phase 37 — a Canvas session is a live collaborative essay
+    // composition, so it needs a `quiz` item carrying at least one
+    // `essay`-subtype question group (was: content_type='writing').
+    let row = sqlx::query!(r#"select content_type, quiz_config from module_items where id = $1"#, item_id).fetch_optional(pool).await?;
+    let Some(row) = row else { return Err(AppError::NotFound("module_item_not_found")) };
+    let has_essay_group = row.content_type.as_deref() == Some("quiz")
+        && row
+            .quiz_config
+            .as_ref()
+            .and_then(|c| c.get("question_groups"))
+            .and_then(|g| g.as_array())
+            .is_some_and(|groups| groups.iter().any(|g| g.get("type").and_then(|v| v.as_str()) == Some("essay")));
+    if !has_essay_group {
+        return Err(AppError::UnprocessableEntity("not_a_writing_item", "canvas sessions require a quiz item with an essay question group".to_string()));
     }
 
     insert_session(pool, conversation_id, item_id).await

@@ -24,6 +24,13 @@ pub enum Resource {
     LearningProduct,
     ProctoringPolicy,
     ProctoringSession,
+    // Phase 32 (P32-002) — the new org-owned class/roster domain
+    // (`classes`/`class_members`), deliberately separate from the
+    // marketplace's `cohorts` (see phase-32 ticket for why).
+    Class,
+    // Phase 36 — "Periode" (batch/semester), pure org-admin territory:
+    // a teacher creates classes, not academic terms.
+    Period,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,13 +89,33 @@ pub fn is_allowed(role: Option<&str>, resource: Resource, action: Action) -> boo
         (TutorProfile, Create) => {
             matches!(role, "platform_admin" | "org_owner" | "academic_director")
         }
-        // P9-003 — only a tutor can list their own products.
-        (LearningProduct, Create) => matches!(role, "platform_admin" | "tutor"),
+        // P9-003 — only a teacher/tutor can list their own products.
+        // ADR-0006's addendum: `teacher`/`tutor` are one
+        // permission-equivalent role, differentiated only by UI label
+        // (organizations.type) — `tutor` stays listed as a legacy
+        // match even though new promotions only ever write `teacher`.
+        (LearningProduct, Create) => matches!(role, "platform_admin" | "teacher" | "tutor"),
         (ProctoringPolicy, Create) => {
             matches!(role, "platform_admin" | "org_owner" | "academic_director")
         }
         (ProctoringSession, Review) => {
             matches!(role, "platform_admin" | "org_owner" | "academic_director")
+        }
+        // Phase 36 — org-admin tier, same as TutorProfile::Create (P9-001).
+        (Period, Create) | (Period, View) => {
+            matches!(role, "platform_admin" | "org_owner" | "academic_director")
+        }
+        // P32-002 — a teacher/tutor creates/manages their own classes;
+        // org-admin tier can too (oversight, and to hand a class to a
+        // teacher). Narrower "is this caller's OWN class" ownership is
+        // enforced separately in services/org_class.rs, same shape as
+        // module_item.rs's can_edit_item — this only gates "can
+        // create/manage a class AT ALL", not "this specific one".
+        // `tutor` listed alongside `teacher` per ADR-0006's addendum
+        // (see LearningProduct::Create above) — legacy match, new
+        // promotions only ever write `teacher`.
+        (Class, Create) | (Class, View) => {
+            matches!(role, "platform_admin" | "org_owner" | "academic_director" | "teacher" | "tutor")
         }
         _ => false,
     }

@@ -8,10 +8,17 @@ use crate::services::wallet;
 
 const TUTOR_SHARE: f64 = 0.7;
 
+// Migration 0040 — an order now settles either a marketplace class
+// enrollment or a subscription, so enrollment_id is optional and `kind`
+// says which fields are meaningful. A DB CHECK enforces that each kind
+// carries the fields it needs, so the branches below can rely on it.
 #[derive(Debug, serde::Serialize, Clone)]
 pub struct OrderResponse {
     pub id: Uuid,
-    pub enrollment_id: Uuid,
+    pub kind: String,
+    pub enrollment_id: Option<Uuid>,
+    pub user_id: Option<Uuid>,
+    pub subscription_tier: Option<String>,
     pub amount_idr: i64,
     pub status: String,
     pub payment_id: Option<String>,
@@ -20,7 +27,7 @@ pub struct OrderResponse {
 pub async fn find_by_enrollment_id(pool: &PgPool, enrollment_id: Uuid) -> Result<Option<OrderResponse>, AppError> {
     let row = sqlx::query_as!(
         OrderResponse,
-        r#"select id, enrollment_id, amount_idr, status, payment_id from orders where enrollment_id = $1"#,
+        r#"select id, kind, enrollment_id, user_id, subscription_tier, amount_idr, status, payment_id from orders where enrollment_id = $1"#,
         enrollment_id,
     )
     .fetch_optional(pool)
@@ -31,7 +38,7 @@ pub async fn find_by_enrollment_id(pool: &PgPool, enrollment_id: Uuid) -> Result
 async fn find_by_payment_id(pool: &PgPool, payment_id: &str) -> Result<Option<OrderResponse>, AppError> {
     let row = sqlx::query_as!(
         OrderResponse,
-        r#"select id, enrollment_id, amount_idr, status, payment_id from orders where payment_id = $1"#,
+        r#"select id, kind, enrollment_id, user_id, subscription_tier, amount_idr, status, payment_id from orders where payment_id = $1"#,
         payment_id,
     )
     .fetch_optional(pool)
@@ -42,7 +49,7 @@ async fn find_by_payment_id(pool: &PgPool, payment_id: &str) -> Result<Option<Or
 pub async fn set_status(pool: &PgPool, id: Uuid, status: &str) -> Result<OrderResponse, AppError> {
     let row = sqlx::query_as!(
         OrderResponse,
-        r#"update orders set status = $2 where id = $1 returning id, enrollment_id, amount_idr, status, payment_id"#,
+        r#"update orders set status = $2 where id = $1 returning id, kind, enrollment_id, user_id, subscription_tier, amount_idr, status, payment_id"#,
         id,
         status,
     )
@@ -90,8 +97,8 @@ pub async fn checkout(pool: &PgPool, ctx: &AuthContext, payment_provider: &dyn P
 
     let order = sqlx::query_as!(
         OrderResponse,
-        r#"insert into orders (enrollment_id, amount_idr) values ($1, $2)
-           returning id, enrollment_id, amount_idr, status, payment_id"#,
+        r#"insert into orders (kind, enrollment_id, amount_idr) values ('enrollment', $1, $2)
+           returning id, kind, enrollment_id, user_id, subscription_tier, amount_idr, status, payment_id"#,
         enrollment_id,
         context.product.price_idr,
     )
@@ -101,7 +108,7 @@ pub async fn checkout(pool: &PgPool, ctx: &AuthContext, payment_provider: &dyn P
     let payment = payment_provider.create_payment(order.id, context.product.price_idr).await?;
     let updated = sqlx::query_as!(
         OrderResponse,
-        r#"update orders set payment_id = $2 where id = $1 returning id, enrollment_id, amount_idr, status, payment_id"#,
+        r#"update orders set payment_id = $2 where id = $1 returning id, kind, enrollment_id, user_id, subscription_tier, amount_idr, status, payment_id"#,
         order.id,
         payment.payment_id,
     )
@@ -109,6 +116,87 @@ pub async fn checkout(pool: &PgPool, ctx: &AuthContext, payment_provider: &dyn P
     .await?;
 
     Ok(CheckoutResult { order: updated, qris_payload: payment.qris_payload })
+}
+
+// POST /subscriptions/checkout — the paywall's entry point. Mirrors the
+// enrollment checkout exactly (insert order, ask the provider for a
+// QRIS payload, store payment_id), so both settle through the same
+// webhook. Price comes from the tier registry server-side, never from
+// the request body.
+pub async fn checkout_subscription(
+    pool: &PgPool,
+    ctx: &AuthContext,
+    payment_provider: &dyn PaymentProvider,
+    tier: &str,
+) -> Result<CheckoutResult, AppError> {
+    let Some(amount_idr) = crate::services::subscription::tier_price_idr(tier) else {
+        return Err(AppError::UnprocessableEntity(
+            "invalid_tier",
+            r#"tier harus "plus" atau "pro""#.to_string(),
+        ));
+    };
+
+    // A user may retry checkout, so an abandoned pending order must not
+    // block them forever the way the enrollment path's UNIQUE does.
+    // Supersede any earlier pending subscription order instead.
+    sqlx::query!(
+        r#"update orders set status = 'cancelled'
+           where kind = 'subscription' and user_id = $1 and status = 'pending'"#,
+        ctx.user_id,
+    )
+    .execute(pool)
+    .await?;
+
+    let order = sqlx::query_as!(
+        OrderResponse,
+        r#"insert into orders (kind, user_id, subscription_tier, amount_idr)
+           values ('subscription', $1, $2, $3)
+           returning id, kind, enrollment_id, user_id, subscription_tier, amount_idr, status, payment_id"#,
+        ctx.user_id,
+        tier,
+        amount_idr,
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let payment = payment_provider.create_payment(order.id, amount_idr).await?;
+    let updated = sqlx::query_as!(
+        OrderResponse,
+        r#"update orders set payment_id = $2 where id = $1
+           returning id, kind, enrollment_id, user_id, subscription_tier, amount_idr, status, payment_id"#,
+        order.id,
+        payment.payment_id,
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(CheckoutResult { order: updated, qris_payload: payment.qris_payload })
+}
+
+// GET /orders/{id} — lets the paywall poll until the webhook settles the
+// QRIS payment, since the provider confirms out-of-band.
+pub async fn get_own_order(pool: &PgPool, ctx: &AuthContext, id: Uuid) -> Result<OrderResponse, AppError> {
+    let order = sqlx::query_as!(
+        OrderResponse,
+        r#"select id, kind, enrollment_id, user_id, subscription_tier, amount_idr, status, payment_id
+           from orders where id = $1"#,
+        id,
+    )
+    .fetch_optional(pool)
+    .await?
+    .ok_or(AppError::NotFound("order_not_found"))?;
+
+    let owner = match order.kind.as_str() {
+        "subscription" => order.user_id,
+        _ => match order.enrollment_id {
+            Some(eid) => crate::services::enrollment::find_by_id(pool, eid).await?.map(|e| e.student_id),
+            None => None,
+        },
+    };
+    if owner != Some(ctx.user_id) {
+        return Err(AppError::Forbidden);
+    }
+    Ok(order)
 }
 
 // POST /payments/{payment_id}/webhook — deliberately PUBLIC (see
@@ -123,7 +211,22 @@ pub async fn handle_webhook(pool: &PgPool, payment_id: &str) -> Result<OrderResp
         return Ok(order);
     }
 
-    let context = load_order_context(pool, order.enrollment_id).await?;
+    // A subscription order has no enrollment and no tutor to pay out —
+    // settling it just activates the tier. Returns early so the
+    // marketplace revenue split below stays enrollment-only.
+    if order.kind == "subscription" {
+        let (Some(user_id), Some(tier)) = (order.user_id, order.subscription_tier.as_deref()) else {
+            return Err(AppError::Internal(anyhow::anyhow!("subscription order missing user_id/tier")));
+        };
+        let updated = set_status(pool, order.id, "paid").await?;
+        crate::services::subscription::activate(pool, user_id, tier).await?;
+        return Ok(updated);
+    }
+
+    let enrollment_id = order
+        .enrollment_id
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("enrollment order missing enrollment_id")))?;
+    let context = load_order_context(pool, enrollment_id).await?;
 
     let updated = set_status(pool, order.id, "paid").await?;
     crate::services::enrollment::set_status(pool, context.enrollment.id, "active").await?;

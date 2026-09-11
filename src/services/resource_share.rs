@@ -5,6 +5,7 @@ use uuid::Uuid;
 use crate::errors::AppError;
 use crate::models::auth::AuthContext;
 use crate::services::drive_permissions::{require_access, require_owner, DriveResource, Permission};
+use crate::services::permissions::{is_allowed, require_permission, Action, Resource};
 use crate::services::resource_activity::log_activity;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -139,4 +140,53 @@ pub async fn unshare_resource(pool: &PgPool, ctx: &AuthContext, resource: DriveR
 pub async fn list_shares(pool: &PgPool, ctx: &AuthContext, resource: DriveResource, resource_id: Uuid) -> Result<Vec<ResourceShare>, AppError> {
     require_access(pool, ctx, resource, resource_id, Permission::Viewer).await?;
     list_for_resource(pool, resource.as_str(), resource_id).await
+}
+
+// Phase 31 (P31-008) — module_item collaborator sharing. Reuses this
+// file's generic table operations (insert/list_for_resource/delete_share/
+// find_matching all already take a plain resource_type string, not the
+// Drive-specific DriveResource enum) but NOT require_owner/require_access
+// — those walk Drive's folder-ancestor/owner_id model, which module_items
+// don't have. Gating here is instead the same role tier that can author
+// module_item content at all (Resource::ModuleItem, Action::Create) —
+// "share management" isn't its own separate permission, any author can
+// invite a collaborator onto any item, mirroring how any author can
+// already edit any item.
+pub async fn share_module_item(pool: &PgPool, ctx: &AuthContext, item_id: Uuid, principal_type: &str, principal_id: &str, permission: &str) -> Result<ResourceShare, AppError> {
+    if principal_type != "user" && principal_type != "role" {
+        return Err(AppError::UnprocessableEntity("invalid_principal_type", "principal_type must be \"user\" or \"role\"".to_string()));
+    }
+    if permission != "viewer" && permission != "editor" {
+        return Err(AppError::UnprocessableEntity("invalid_permission", "permission must be \"viewer\" or \"editor\"".to_string()));
+    }
+    require_permission(ctx, Resource::ModuleItem, Action::Create)?;
+    insert(pool, "module_item", item_id, principal_type, principal_id, permission, ctx.user_id).await
+}
+
+pub async fn unshare_module_item(pool: &PgPool, ctx: &AuthContext, share_id: Uuid) -> Result<(), AppError> {
+    require_permission(ctx, Resource::ModuleItem, Action::Create)?;
+    let deleted = delete_share(pool, share_id).await?;
+    if deleted == 0 {
+        return Err(AppError::NotFound("share_not_found"));
+    }
+    Ok(())
+}
+
+// Listing is open to the same author tier PLUS anyone who already has
+// a grant on this item (a collaborator can see who else is on the
+// item they were invited to, same as Google Docs' share dialog shows
+// every collaborator to every collaborator, not just the owner).
+pub async fn list_module_item_shares(pool: &PgPool, ctx: &AuthContext, item_id: Uuid) -> Result<Vec<ResourceShare>, AppError> {
+    if !is_allowed(ctx.role.as_deref(), Resource::ModuleItem, Action::Create) && !has_module_item_grant(pool, ctx.user_id, ctx.role.as_deref(), item_id, "viewer").await? {
+        return Err(AppError::Forbidden);
+    }
+    list_for_resource(pool, "module_item", item_id).await
+}
+
+// `need` is "viewer" (any grant qualifies) or "editor" (only an editor
+// grant qualifies) — mirrors drive_permissions::Permission's ranking
+// without pulling in that Drive-specific type.
+pub async fn has_module_item_grant(pool: &PgPool, user_id: Uuid, role: Option<&str>, item_id: Uuid, need: &str) -> Result<bool, AppError> {
+    let matches = find_matching(pool, "module_item", &[item_id], user_id, role).await?;
+    Ok(matches.iter().any(|m| m.permission == "editor" || (need == "viewer" && m.permission == "viewer")))
 }

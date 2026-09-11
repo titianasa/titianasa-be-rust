@@ -9,12 +9,23 @@ pub struct CreateAssessmentRequest {
     pub question_ids: Vec<Uuid>,
 }
 
-// POST /attempts/{id}/submit — the 3 fields are mutually exclusive
-// depending on the attempt's own kind (assessment vs. writing-lesson vs.
-// speaking-lesson), matching assessment_handler.ts's SubmitRequest.
+// POST /attempts/{id}/submit — mutually exclusive depending on the
+// attempt's own kind: `answers` for a plain assessment (question-id
+// keyed), `quiz_answers` for a Phase 37 quiz item (question_group-id
+// keyed — an arbitrary string from quiz_config, not necessarily a
+// UUID).
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct SubmitAttemptRequest {
     pub answers: Option<HashMap<Uuid, serde_json::Value>>,
-    pub answer_text: Option<String>,
-    pub answer_audio_asset_id: Option<Uuid>,
+    pub quiz_answers: Option<HashMap<String, serde_json::Value>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct GradeManualGroupRequest {
+    pub group_id: String,
+    /// Which question inside the group this verdict is for — a group can
+    /// hold several separately-graded submissions.
+    pub question_number: String,
+    pub score: f64,
+    pub feedback: Option<String>,
 }

@@ -9,10 +9,10 @@ use uuid::Uuid;
 use crate::errors::AppError;
 use crate::extract::ValidatedJson;
 use crate::models::auth::AuthContext;
-use crate::models::requests::assessment::{CreateAssessmentRequest, SubmitAttemptRequest};
+use crate::models::requests::assessment::{CreateAssessmentRequest, GradeManualGroupRequest, SubmitAttemptRequest};
 use crate::models::responses::assessment::AssessmentSummary;
 use crate::services::assessment::{self, CreateAttemptResponse, CreateLessonAttemptResponse};
-use crate::services::{achievement, ai_speaking_evaluation, ai_writing_evaluation, daily_mission, exam_session, streak, xp};
+use crate::services::{achievement, daily_mission, exam_session, quiz_attempt, quiz_subtype, streak, xp};
 use crate::state::AppState;
 
 // POST /assessments
@@ -76,34 +76,41 @@ pub async fn post_submit(
     let attempt = assessment::find_attempt(&state.db, attempt_id).await?.ok_or(AppError::NotFound("attempt_not_found"))?;
 
     if let Some(item_id) = attempt.item_id {
-        let content_type = sqlx::query_scalar!(r#"select content_type from module_items where id = $1"#, item_id)
+        // Phase 37 — every item-anchored attempt is a `quiz` item now
+        // (writing/speaking retired, see migrations/0038). Skill XP is
+        // keyed off the FIRST question group's subtype family when it
+        // maps to an existing xp::skill_xp tier (reading/listening/
+        // grammar/vocabulary); production/interactive subjects don't
+        // have an English-specific skill category, so those fall back
+        // to the same flat tier assessment_xp already uses for an
+        // untyped assessment.
+        let quiz_config = sqlx::query_scalar!(r#"select quiz_config from module_items where id = $1"#, item_id)
             .fetch_optional(&state.db)
             .await?
             .ok_or_else(|| AppError::Internal(anyhow::anyhow!("attempt references a missing module item")))?;
+        let skill_category = quiz_config
+            .as_ref()
+            .and_then(|c| c.get("question_groups"))
+            .and_then(|g| g.as_array())
+            .and_then(|groups| groups.first())
+            .and_then(|g| g.get("subtype")).and_then(|v| v.as_str())
+            .and_then(quiz_subtype::find)
+            .and_then(|info| match info.family {
+                quiz_subtype::SubtypeFamily::Reading => Some("reading"),
+                quiz_subtype::SubtypeFamily::Listening => Some("listening"),
+                quiz_subtype::SubtypeFamily::Grammar => Some("grammar"),
+                quiz_subtype::SubtypeFamily::Vocabulary => Some("vocabulary"),
+                quiz_subtype::SubtypeFamily::Production | quiz_subtype::SubtypeFamily::Interactive => None,
+            });
 
-        if content_type.as_deref() == Some("speaking") {
-            let audio_asset_id = body
-                .answer_audio_asset_id
-                .ok_or_else(|| AppError::UnprocessableEntity("missing_answer_audio_asset_id", "answer_audio_asset_id is required to submit a speaking attempt".to_string()))?;
-            let result = ai_speaking_evaluation::submit_speaking_attempt(&state.db, &state.config, state.ai_provider.as_ref(), state.storage.as_ref(), &ctx, attempt_id, audio_asset_id).await?;
+        let quiz_answers = body.quiz_answers.unwrap_or_default();
+        let result = quiz_attempt::submit_quiz_attempt(&state.db, &state.config, state.ai_provider.as_ref(), state.storage.as_ref(), &ctx, attempt_id, &quiz_answers).await?;
 
-            xp::award_xp(&state.db, ctx.user_id, xp::skill_xp("speaking").unwrap(), "speaking_completed", Some(&format!("attempt:{attempt_id}")), Some("speaking")).await?;
-            streak::record_activity(&state.db, ctx.user_id, chrono::Utc::now()).await?;
-            achievement::check_and_award(&state.db, ctx.user_id, &achievement::ActivityContext { skill_category: Some("speaking".to_string()), question_ids: vec![] }).await?;
-            daily_mission::record_progress(&state.db, ctx.user_id, Some("speaking"), chrono::Utc::now()).await?;
-
-            return Ok(Json(serde_json::to_value(result).map_err(|e| AppError::Internal(e.into()))?));
-        }
-
-        let answer_text = body
-            .answer_text
-            .ok_or_else(|| AppError::UnprocessableEntity("missing_answer_text", "answer_text is required to submit a writing attempt".to_string()))?;
-        let result = ai_writing_evaluation::submit_writing_attempt(&state.db, state.ai_provider.as_ref(), &state.config.ai_writing_evaluation_model, &ctx, attempt_id, &answer_text).await?;
-
-        xp::award_xp(&state.db, ctx.user_id, xp::skill_xp("writing").unwrap(), "writing_completed", Some(&format!("attempt:{attempt_id}")), Some("writing")).await?;
+        let xp_amount = skill_category.and_then(xp::skill_xp).unwrap_or(20);
+        xp::award_xp(&state.db, ctx.user_id, xp_amount, "quiz_completed", Some(&format!("attempt:{attempt_id}")), skill_category).await?;
         streak::record_activity(&state.db, ctx.user_id, chrono::Utc::now()).await?;
-        achievement::check_and_award(&state.db, ctx.user_id, &achievement::ActivityContext { skill_category: Some("writing".to_string()), question_ids: vec![] }).await?;
-        daily_mission::record_progress(&state.db, ctx.user_id, Some("writing"), chrono::Utc::now()).await?;
+        achievement::check_and_award(&state.db, ctx.user_id, &achievement::ActivityContext { skill_category: skill_category.map(String::from), question_ids: vec![] }).await?;
+        daily_mission::record_progress(&state.db, ctx.user_id, skill_category, chrono::Utc::now()).await?;
 
         return Ok(Json(serde_json::to_value(result).map_err(|e| AppError::Internal(e.into()))?));
     }
@@ -123,4 +130,16 @@ pub async fn post_submit(
     exam_session::record_submission(&state.db, assessment_id, ctx.user_id, chrono::Utc::now()).await?;
 
     Ok(Json(serde_json::to_value(result).map_err(|e| AppError::Internal(e.into()))?))
+}
+
+// POST /attempts/{id}/grade — a teacher scores one Manual-mode quiz
+// question group.
+pub async fn post_grade_attempt(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
+    Path(attempt_id): Path<Uuid>,
+    ValidatedJson(body): ValidatedJson<GradeManualGroupRequest>,
+) -> Result<StatusCode, AppError> {
+    quiz_attempt::grade_manual_group(&state.db, &ctx, attempt_id, &body.group_id, &body.question_number, body.score, body.feedback).await?;
+    Ok(StatusCode::NO_CONTENT)
 }

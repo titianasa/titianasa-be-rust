@@ -19,10 +19,15 @@ impl From<TutorProfileRow> for TutorProfileResponse {
     }
 }
 
-// Port of tutor_repository.ts's assign — assigns the `tutor` role AND
-// creates the profile row in 1 transaction, idempotent on both (a
-// caller re-assigning an existing tutor gets the existing row back,
-// not an error).
+// Port of tutor_repository.ts's assign — assigns the org's teaching
+// role AND creates the profile row in 1 transaction, idempotent on
+// both (a caller re-assigning an existing teacher/tutor gets the
+// existing row back, not an error). Per ADR-0006's addendum, `teacher`
+// and `tutor` are one permission-equivalent role differentiated only
+// by UI label (from organizations.type) — this always writes
+// `teacher`, the one canonical value, whether called from the
+// org-admin "promote" endpoint below or learning_product.rs's lazy
+// profile provisioning on someone's first marketplace product.
 async fn assign(
     pool: &PgPool,
     user_id: Uuid,
@@ -33,7 +38,7 @@ async fn assign(
     let mut tx = pool.begin().await?;
 
     sqlx::query!(
-        r#"insert into user_organization_roles (user_id, organization_id, role) values ($1, $2, 'tutor')
+        r#"insert into user_organization_roles (user_id, organization_id, role) values ($1, $2, 'teacher')
            on conflict (user_id, organization_id, role) do nothing"#,
         user_id,
         organization_id,
@@ -131,7 +136,11 @@ async fn list_by_organization(pool: &PgPool, organization_id: Uuid) -> Result<Ve
         .collect())
 }
 
-// POST /organizations/{id}/tutors
+// POST /organizations/{id}/tutors — despite the route name, this is
+// the ONE org-admin "promote a member" path for both Guru/Tutor (see
+// assign()'s doc comment); the route itself is unrenamed to match
+// ADR-0006's addendum, which named this exact path as the single
+// assign endpoint for both labels.
 pub async fn assign_tutor(
     pool: &PgPool,
     ctx: &AuthContext,

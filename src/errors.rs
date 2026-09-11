@@ -77,6 +77,16 @@ impl From<crate::services::storage::StorageError> for AppError {
     }
 }
 
+// Postgres SQLSTATE 23505 = unique_violation. Returns the violated
+// constraint's name so the response says WHICH uniqueness rule broke.
+fn unique_violation_constraint(e: &sqlx::Error) -> Option<String> {
+    let db_err = e.as_database_error()?;
+    if db_err.code().as_deref() != Some("23505") {
+        return None;
+    }
+    Some(db_err.constraint().unwrap_or("unique").to_string())
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         let (status, body): (StatusCode, Value) = match &self {
@@ -104,10 +114,24 @@ impl IntoResponse for AppError {
             AppError::BadGateway(code, detail) => (StatusCode::BAD_GATEWAY, json!({"error": code, "detail": detail})),
             AppError::PayloadTooLarge(code) => (StatusCode::PAYLOAD_TOO_LARGE, json!({"error": code, "detail": null})),
             AppError::AiOutputValidationFailed => (StatusCode::UNPROCESSABLE_ENTITY, json!({"error": "ai_output_validation_failed", "detail": null})),
-            AppError::Database(e) => {
-                tracing::error!(error = ?e, "database error");
-                (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "internal_error", "detail": null}))
-            }
+            // A unique-key clash is the CALLER re-sending a value that
+            // already exists (e.g. modules.code), not a server fault —
+            // it used to surface as an opaque 500 internal_error, which
+            // gave the client nothing to act on. Everything else from
+            // the database really is a 500.
+            AppError::Database(e) => match unique_violation_constraint(e) {
+                Some(constraint) => {
+                    tracing::warn!(%constraint, "unique constraint violation");
+                    (
+                        StatusCode::CONFLICT,
+                        json!({"error": "duplicate_value", "detail": format!("value already exists (constraint: {constraint})")}),
+                    )
+                }
+                None => {
+                    tracing::error!(error = ?e, "database error");
+                    (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "internal_error", "detail": null}))
+                }
+            },
             AppError::Internal(e) => {
                 tracing::error!(error = ?e, "internal error");
                 (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "internal_error", "detail": null}))

@@ -48,6 +48,10 @@ pub struct Config {
     pub ai_question_generation_model: String,
     pub ai_ocr_model: String,
     pub ai_tts_model: String,
+    // Phase 31 (P31-005) — real-time collaborative editing.
+    pub collab_checkpoint_interval_seconds: i64,
+    // Phase 37 — Live AI Chat (the Modul Belajar text tutor).
+    pub ai_live_chat_model: String,
 }
 
 impl Config {
@@ -74,7 +78,7 @@ impl Config {
             ai_stt_model: std::env::var("AI_STT_MODEL").unwrap_or_else(|_| "openai/whisper-1".into()),
             ai_tts_default_voice: std::env::var("AI_TTS_DEFAULT_VOICE").unwrap_or_else(|_| "af_bella".into()),
             ai_speaking_room_text_model: std::env::var("AI_SPEAKING_ROOM_TEXT_MODEL")
-                .unwrap_or_else(|_| "~deepseek/deepseek-v4-flash-latest".into()),
+                .unwrap_or_else(|_| "deepseek/deepseek-v4.1-flash".into()),
             ai_speaking_room_tts_model: std::env::var("AI_SPEAKING_ROOM_TTS_MODEL")
                 .unwrap_or_else(|_| "google/gemini-3.1-flash-tts-preview".into()),
             asset_max_bytes: env_int("ASSET_MAX_BYTES", 25 * 1024 * 1024)?,
@@ -87,14 +91,16 @@ impl Config {
             frss_partial_threshold: env_float("FRSS_PARTIAL_THRESHOLD", 0.4)?,
             module_completion_min_accuracy: env_float("MODULE_COMPLETION_MIN_ACCURACY", 80.0)?,
             module_completion_skip_credit_cost: env_int("MODULE_COMPLETION_SKIP_CREDIT_COST", 15)?,
-            ai_writing_evaluation_model: std::env::var("AI_WRITING_EVALUATION_MODEL").unwrap_or_else(|_| "~deepseek/deepseek-v4-flash-latest".into()),
-            ai_speaking_evaluation_model: std::env::var("AI_SPEAKING_EVALUATION_MODEL").unwrap_or_else(|_| "~deepseek/deepseek-v4-flash-latest".into()),
+            ai_writing_evaluation_model: std::env::var("AI_WRITING_EVALUATION_MODEL").unwrap_or_else(|_| "deepseek/deepseek-v4.1-flash".into()),
+            ai_speaking_evaluation_model: std::env::var("AI_SPEAKING_EVALUATION_MODEL").unwrap_or_else(|_| "deepseek/deepseek-v4.1-flash".into()),
             ai_grammar_evaluation_credit_cost: env_int("AI_GRAMMAR_EVALUATION_CREDIT_COST", 1)?,
-            ai_grammar_evaluation_model: std::env::var("AI_GRAMMAR_EVALUATION_MODEL").unwrap_or_else(|_| "~deepseek/deepseek-v4-flash-latest".into()),
-            ai_lesson_generation_model: std::env::var("AI_LESSON_GENERATION_MODEL").unwrap_or_else(|_| "~deepseek/deepseek-v4-flash-latest".into()),
-            ai_question_generation_model: std::env::var("AI_QUESTION_GENERATION_MODEL").unwrap_or_else(|_| "~deepseek/deepseek-v4-flash-latest".into()),
+            ai_grammar_evaluation_model: std::env::var("AI_GRAMMAR_EVALUATION_MODEL").unwrap_or_else(|_| "deepseek/deepseek-v4.1-flash".into()),
+            ai_lesson_generation_model: std::env::var("AI_LESSON_GENERATION_MODEL").unwrap_or_else(|_| "deepseek/deepseek-v4.1-flash".into()),
+            ai_question_generation_model: std::env::var("AI_QUESTION_GENERATION_MODEL").unwrap_or_else(|_| "deepseek/deepseek-v4.1-flash".into()),
             ai_ocr_model: std::env::var("AI_OCR_MODEL").unwrap_or_else(|_| "deepseek/deepseek-v4-flash-vision-exp".into()),
             ai_tts_model: std::env::var("AI_TTS_MODEL").unwrap_or_else(|_| "hexgrad/kokoro-82m".into()),
+            collab_checkpoint_interval_seconds: env_int("COLLAB_CHECKPOINT_INTERVAL_SECONDS", 15)?,
+            ai_live_chat_model: std::env::var("AI_LIVE_CHAT_MODEL").unwrap_or_else(|_| "deepseek/deepseek-v4.1-flash".into()),
         })
     }
 }

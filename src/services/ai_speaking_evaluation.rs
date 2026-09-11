@@ -3,12 +3,9 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::errors::AppError;
-use crate::models::auth::AuthContext;
 use crate::services::ai_provider::{resolve_max_tokens, strip_code_fence, AIProvider, GenerationRequest};
 use crate::services::ai_writing_evaluation::{FeedbackDto, PositionDto};
-use crate::services::drive_permissions::DriveResource;
-use crate::services::storage::AssetStorage;
-use crate::services::{ai_task, assessment, evaluation};
+use crate::services::{ai_task, evaluation};
 
 const SPEAKING_RUBRIC_ID: Uuid = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_00f2);
 const PROVIDER: &str = "deepseek";
@@ -103,7 +100,11 @@ pub struct SpeakingEvaluationResult {
     pub evaluation: Option<SpeakingEvaluationDto>,
 }
 
-async fn run_speaking_evaluation(pool: &PgPool, config: &Config, ai: &dyn AIProvider, user_id: Uuid, attempt_id: Uuid, audio_bytes: &[u8], audio_content_type: &str, question_id: Option<Uuid>) -> SpeakingEvaluationResult {
+// Phase 37 — exposed (was private) so quiz_attempt.rs can grade any
+// AiRubric-mode quiz subtype backed by audio (voice_record,
+// speaking_challenge, listen_repeat), not just the item-level
+// `speaking` submit path below.
+pub async fn run_speaking_evaluation(pool: &PgPool, config: &Config, ai: &dyn AIProvider, user_id: Uuid, attempt_id: Uuid, audio_bytes: &[u8], audio_content_type: &str, question_id: Option<Uuid>) -> SpeakingEvaluationResult {
     let ai_task_id = Uuid::new_v4();
     let Ok(rubric) = ensure_speaking_rubric(pool).await else {
         return SpeakingEvaluationResult { transcript: None, evaluation: None };
@@ -170,47 +171,9 @@ async fn run_speaking_evaluation(pool: &PgPool, config: &Config, ai: &dyn AIProv
     }
 }
 
-#[derive(Debug, serde::Serialize)]
-pub struct SpeakingSubmitResponse {
-    pub attempt_id: Uuid,
-    pub status: String,
-    pub transcript: Option<String>,
-    pub evaluation: Option<SpeakingEvaluationDto>,
-}
-
-// POST /attempts/{id}/submit — speaking branch. Access to the audio
-// asset is validated BEFORE anything is accepted (unlike writing's
-// "always accept then maybe fail eval") — a bad asset id/ownership
-// rejects the whole submit, attempt stays in_progress.
-pub async fn submit_speaking_attempt(pool: &PgPool, config: &Config, ai: &dyn AIProvider, storage: &dyn AssetStorage, ctx: &AuthContext, attempt_id: Uuid, audio_asset_id: Uuid) -> Result<SpeakingSubmitResponse, AppError> {
-    crate::services::permissions::require_permission(ctx, crate::services::permissions::Resource::Attempt, crate::services::permissions::Action::Submit)?;
-    let attempt = assessment::load_submittable_attempt(pool, ctx, attempt_id).await?;
-    if attempt.item_id.is_none() {
-        return Err(AppError::Internal(anyhow::anyhow!("attempt has no item_id")));
-    }
-
-    let access = crate::services::drive_permissions::resolve_access(pool, ctx, DriveResource::Asset, audio_asset_id).await?;
-    if access.is_none() {
-        return Err(AppError::NotFound("asset_not_found"));
-    }
-    let asset = crate::services::asset::find_by_id(pool, audio_asset_id).await?.ok_or(AppError::NotFound("asset_not_found"))?;
-
-    assessment::submit_speaking_lesson_attempt(pool, attempt_id, audio_asset_id).await?;
-
-    let object = match storage.get(&asset.id.to_string()).await {
-        Ok(o) => o,
-        Err(e) => {
-            tracing::warn!(error = ?e, "failed to read audio asset for speaking evaluation");
-            let ai_task_id = Uuid::new_v4();
-            let _ = ai_task::insert_failed(pool, ai_task_id, ctx.user_id, "speaking_evaluation", PROVIDER, &config.ai_speaking_evaluation_model, SPEAKING_EVALUATION_PROMPT_ID).await;
-            return Ok(SpeakingSubmitResponse { attempt_id, status: "submitted".to_string(), transcript: None, evaluation: None });
-        }
-    };
-
-    let result = run_speaking_evaluation(pool, config, ai, ctx.user_id, attempt_id, &object.bytes, &object.content_type, None).await;
-    let Some(evaluation) = result.evaluation else {
-        return Ok(SpeakingSubmitResponse { attempt_id, status: "submitted".to_string(), transcript: result.transcript, evaluation: None });
-    };
-    assessment::mark_attempt_evaluated(pool, attempt_id, evaluation.scores.overall).await?;
-    Ok(SpeakingSubmitResponse { attempt_id, status: "evaluated".to_string(), transcript: result.transcript, evaluation: Some(evaluation) })
-}
+// Phase 37 — the old item-level "speaking" submit entry point
+// (submit_speaking_attempt) is retired along with the content_type
+// itself (see migrations/0038); quiz_attempt.rs's submit_quiz_attempt
+// now calls run_speaking_evaluation directly per question group,
+// keyed off the group's `voice_record`/`speaking_challenge`/
+// `listen_repeat` subtype instead of the item's own content_type.

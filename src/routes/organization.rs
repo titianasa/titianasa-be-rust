@@ -12,10 +12,14 @@ use crate::state::AppState;
 // routes/auth.rs's protected_routes subtree by the caller.
 pub fn protected_routes() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/organizations", post(handlers::organization::post_organization))
+        .route("/organizations/join", post(handlers::organization::post_organization_join))
+        .route("/organizations/{id}", get(handlers::organization::get_organization))
         .route("/organizations/{id}/members", get(handlers::organization::get_members))
         .route(
             "/organizations/{id}/tutors",
             post(handlers::tutor::post_tutor).get(handlers::tutor::get_tutors),
         )
         .route("/tutors/me", patch(handlers::tutor::patch_own_profile))
+        .route("/me/teacher-role", post(handlers::organization::post_me_teacher_role))
 }

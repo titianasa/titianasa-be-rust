@@ -27,6 +27,8 @@ struct ModuleRow {
     version: i32,
     order_index: i32,
     generated_by: String,
+    metadata: Option<serde_json::Value>,
+    source_module_id: Option<Uuid>,
 }
 
 fn to_response(m: &ModuleRow) -> ModuleResponse {
@@ -42,13 +44,27 @@ fn to_response(m: &ModuleRow) -> ModuleResponse {
         version: m.version,
         order_index: m.order_index,
         generated_by: m.generated_by.clone(),
+        metadata: m.metadata.clone(),
+        source_module_id: m.source_module_id,
     }
+}
+
+// Migration 0042 — a reference row owns no content; everything is read
+// from the module it points at. Every content read goes through here so
+// a learning path's reference and the library module it points at can
+// never drift apart.
+pub async fn resolve_content_module(pool: &PgPool, id: Uuid) -> Result<Uuid, AppError> {
+    let source = sqlx::query_scalar!(r#"select source_module_id from modules where id = $1"#, id)
+        .fetch_optional(pool)
+        .await?
+        .flatten();
+    Ok(source.unwrap_or(id))
 }
 
 async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<ModuleRow>, AppError> {
     let row = sqlx::query_as!(
         ModuleRow,
-        r#"select id, parent_id, is_folder, subject_id, code, title, description, status, version, order_index, generated_by
+        r#"select id, parent_id, is_folder, subject_id, code, title, description, status, version, order_index, generated_by, metadata, source_module_id
            from modules where id = $1"#,
         id,
     )
@@ -102,17 +118,33 @@ pub async fn create(pool: &PgPool, ctx: &AuthContext, req: CreateModuleRequest) 
         find_by_id(pool, parent_id).await?.ok_or(AppError::NotFound("module_not_found"))?;
     }
 
+    // A reference must point at a real module that is NOT itself a
+    // reference — chaining them would make every content read walk an
+    // arbitrary chain for no benefit, since a path always knows the
+    // library module it wants.
+    if let Some(source_id) = req.source_module_id {
+        let source = find_by_id(pool, source_id).await?.ok_or(AppError::NotFound("source_module_not_found"))?;
+        if source.source_module_id.is_some() {
+            return Err(AppError::UnprocessableEntity(
+                "invalid_source",
+                "source_module_id tidak boleh menunjuk ke baris referensi lain".to_string(),
+            ));
+        }
+    }
+
     let row = sqlx::query_as!(
         ModuleRow,
-        r#"insert into modules (parent_id, is_folder, subject_id, code, title, description, generated_by)
-           values ($1, $2, $3, $4, $5, $6, 'human')
-           returning id, parent_id, is_folder, subject_id, code, title, description, status, version, order_index, generated_by"#,
+        r#"insert into modules (parent_id, is_folder, subject_id, code, title, description, generated_by, metadata, source_module_id)
+           values ($1, $2, $3, $4, $5, $6, 'human', $7, $8)
+           returning id, parent_id, is_folder, subject_id, code, title, description, status, version, order_index, generated_by, metadata, source_module_id"#,
         req.parent_id,
         req.is_folder,
         req.subject_id,
         req.code,
         req.title,
         req.description,
+        req.metadata,
+        req.source_module_id,
     )
     .fetch_one(pool)
     .await?;
@@ -131,7 +163,7 @@ pub async fn get(pool: &PgPool, id: Uuid) -> Result<ModuleResponse, AppError> {
 pub async fn list_children(pool: &PgPool, parent_id: Option<Uuid>) -> Result<ListModulesResponse, AppError> {
     let rows = sqlx::query_as!(
         ModuleRow,
-        r#"select id, parent_id, is_folder, subject_id, code, title, description, status, version, order_index, generated_by
+        r#"select id, parent_id, is_folder, subject_id, code, title, description, status, version, order_index, generated_by, metadata, source_module_id
            from modules where parent_id is not distinct from $1 order by order_index asc"#,
         parent_id,
     )
@@ -178,19 +210,83 @@ pub async fn update(pool: &PgPool, ctx: &AuthContext, id: Uuid, req: UpdateModul
 
     let title = req.title.unwrap_or(existing.title);
     let description = req.description.or(existing.description);
+    let metadata = req.metadata.or(existing.metadata);
+    // A folder has no subject regardless of what was sent — mirrors
+    // create()'s is_folder-conditional requirement the other direction.
+    let subject_id = if existing.is_folder { None } else { req.subject_id.or(existing.subject_id) };
 
     let row = sqlx::query_as!(
         ModuleRow,
-        r#"update modules set title = $2, description = $3, parent_id = $4, updated_at = now() where id = $1
-           returning id, parent_id, is_folder, subject_id, code, title, description, status, version, order_index, generated_by"#,
+        r#"update modules set title = $2, description = $3, parent_id = $4, metadata = $5, subject_id = $6, updated_at = now() where id = $1
+           returning id, parent_id, is_folder, subject_id, code, title, description, status, version, order_index, generated_by, metadata, source_module_id"#,
         id,
         title,
         description,
         new_parent_id,
+        metadata,
+        subject_id,
     )
     .fetch_one(pool)
     .await?;
     Ok(to_response(&row))
+}
+
+// DELETE /modules/{id} — the missing half of Content Studio's module
+// CRUD (create/read/update existed; a module, once made, could never be
+// removed again). Refuses when any item anywhere in the subtree has a
+// real learner attempt against it — that's a hard stop, not a
+// confirmation dialog's job, since deleting IS irreversible and no UI
+// warning changes that a wrong click would destroy real learner data.
+// A folder's whole subtree goes in one statement (parent_id has no
+// cascade), same shape as learning_path.rs's delete_subtree.
+pub async fn delete(pool: &PgPool, ctx: &AuthContext, id: Uuid) -> Result<(), AppError> {
+    require_permission(ctx, Resource::Module, Action::Create)?;
+    find_by_id(pool, id).await?.ok_or(AppError::NotFound("module_not_found"))?;
+
+    let attempt_count = sqlx::query_scalar!(
+        r#"with recursive subtree as (
+             select id from modules where id = $1
+             union all
+             select m.id from modules m join subtree s on m.parent_id = s.id
+           )
+           select count(*) as "n!" from attempts a
+           where a.item_id in (select i.id from module_items i where i.module_id in (select id from subtree))"#,
+        id,
+    )
+    .fetch_one(pool)
+    .await?;
+    if attempt_count > 0 {
+        return Err(AppError::UnprocessableEntity(
+            "module_has_attempts",
+            format!(
+                "cannot delete: {attempt_count} learner attempt(s) exist under this module or its descendants"
+            ),
+        ));
+    }
+
+    sqlx::query!(
+        r#"with recursive subtree as (
+             select id from modules where id = $1
+             union all
+             select m.id from modules m join subtree s on m.parent_id = s.id
+           ),
+           all_ids as (select distinct id from subtree),
+           del_blocks as (
+             delete from content_blocks
+              where item_id in (select i.id from module_items i where i.module_id in (select id from all_ids))
+           ),
+           del_refs as (
+             -- A reference row pointing INTO this subtree from outside it
+             -- would otherwise dangle post-delete (source_module_id has no
+             -- cascade, by design — see migration 0042).
+             delete from modules where source_module_id in (select id from all_ids) and id not in (select id from all_ids)
+           )
+           delete from modules where id in (select id from all_ids)"#,
+        id,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 // POST /modules/reorder — batch sibling order_index rewrite, one

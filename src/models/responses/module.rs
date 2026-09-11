@@ -16,6 +16,10 @@ pub struct ModuleResponse {
     pub version: i32,
     pub order_index: i32,
     pub generated_by: String,
+    pub metadata: Option<serde_json::Value>,
+    /// Set when this row is a reference into the master library — its
+    /// content comes from that module, not from this one.
+    pub source_module_id: Option<Uuid>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -58,6 +62,11 @@ pub struct ModuleItemNode {
     pub content_type: Option<String>,
     pub status: String,
     pub generated_by: String,
+    /// Learners only — why this item cannot be opened yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_reason: Option<String>,
+    /// Learners only — whether they have finished it.
+    pub completed: bool,
     pub children: Vec<ModuleItemNode>,
 }
 
@@ -83,10 +92,29 @@ pub struct ModuleItemDetailResponse {
     pub node_type: String,
     pub title: String,
     pub content_type: Option<String>,
+    // Phase 37 — set only when content_type="quiz"; { sections, question_groups }.
+    pub quiz_config: Option<serde_json::Value>,
     pub status: String,
     pub blocks: Vec<ModuleItemBlockResponse>,
     pub qa_report: Option<serde_json::Value>,
     pub generated_by: String,
+    /// Migration 0043 — set only when this item's subject diverges from
+    /// its module's; None means "inherit the module's subject".
+    pub subject_id: Option<Uuid>,
+    /// Migration 0044 — set when an article is a sectioned Modul Belajar.
+    pub lesson_plan: Option<serde_json::Value>,
+    /// Migration 0045 — "Aturan Akses & Guard" and "Attendance Guard".
+    pub guard_config: Option<serde_json::Value>,
+    pub attendance_guard: Option<serde_json::Value>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct LessonPlanSaveResponse {
+    pub id: Uuid,
+    pub status: String,
+    pub qa_report: Option<serde_json::Value>,
+    /// The plan as stored — ids filled in, text trimmed.
+    pub lesson_plan: serde_json::Value,
 }
 
 #[derive(Debug, serde::Serialize)]

@@ -118,11 +118,18 @@ pub struct RoleRow {
     pub role: String,
 }
 
-// Port of user_repository.ts's findAllRoles.
+// Port of user_repository.ts's findAllRoles. Ordered (not just a plain
+// select) because `account-sync.tsx`'s own doc comment treats `roles[0]`
+// as "the account's default org" everywhere in the frontend — there's no
+// org-switcher UI. Admin-tier roles first, most-recent first, so a
+// freshly created/promoted-into org naturally becomes "the" active one
+// without any other frontend change (Phase 33).
 pub async fn find_all_roles(pool: &PgPool, user_id: Uuid) -> Result<Vec<RoleRow>, AppError> {
     let rows = sqlx::query_as!(
         RoleRow,
-        r#"select organization_id, role from user_organization_roles where user_id = $1"#,
+        r#"select organization_id, role from user_organization_roles where user_id = $1
+           order by case when role in ('platform_admin', 'org_owner', 'academic_director') then 0 else 1 end,
+                    created_at desc"#,
         user_id,
     )
     .fetch_all(pool)
@@ -145,11 +152,23 @@ pub async fn find_role_in_org(pool: &PgPool, user_id: Uuid, organization_id: Uui
     Ok(row)
 }
 
+// Phase 33 — must stay in lockstep with find_all_roles' ordering
+// (same case/created_at expression). This is the org `require_permission_
+// in_org` actually gates against per-request (middleware/auth.rs's
+// resolve_auth_context, when no `x-organization-id` header is sent) —
+// before this fix it independently used `created_at asc` (oldest role),
+// while find_all_roles (what `/users/me` returns, what the frontend
+// treats as "the active org") used the new priority order. That
+// mismatch meant a user could see their new org as "active" in the UI
+// while every permission check still silently gated against their OLD
+// org, 403ing on their own freshly created organization.
 pub async fn find_default_role(pool: &PgPool, user_id: Uuid) -> Result<Option<RoleRow>, AppError> {
     let row = sqlx::query_as!(
         RoleRow,
-        r#"select organization_id, role from user_organization_roles
-           where user_id = $1 order by created_at asc limit 1"#,
+        r#"select organization_id, role from user_organization_roles where user_id = $1
+           order by case when role in ('platform_admin', 'org_owner', 'academic_director') then 0 else 1 end,
+                    created_at desc
+           limit 1"#,
         user_id,
     )
     .fetch_optional(pool)

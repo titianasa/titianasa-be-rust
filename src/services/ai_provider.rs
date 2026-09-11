@@ -3,6 +3,8 @@ use std::sync::OnceLock;
 
 use tokio::sync::OnceCell;
 
+use crate::errors::AppError;
+
 // Port of ai_provider.ts. Provider abstraction (ADR-0004) — business
 // logic never calls a provider API directly, always through this trait,
 // injected via AppState (same pattern as PaymentProvider).
@@ -79,6 +81,38 @@ fn http_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(reqwest::Client::new)
 }
 
+/// The curated allowlist an author may pick from for text/quiz
+/// generation (`GET /ai/models`), deliberately NOT every model
+/// OpenRouter exposes — each entry here is a price/quality tradeoff
+/// worth naming for a non-technical author, not a raw model catalog.
+/// Both confirmed on OpenRouter to support `response_format: json_object`
+/// (required by the quiz generator's JSON-mode calls) and image input.
+/// First entry is the default. Phase 38 (K2).
+pub const AI_MODEL_OPTIONS: &[(&str, &str)] = &[
+    ("deepseek/deepseek-v4.1-flash", "Cepat"),
+    ("deepseek/deepseek-v4-pro", "Kualitas tinggi"),
+];
+
+pub fn default_ai_model() -> &'static str {
+    AI_MODEL_OPTIONS[0].0
+}
+
+pub fn is_allowed_ai_model(model: &str) -> bool {
+    AI_MODEL_OPTIONS.iter().any(|(id, _)| *id == model)
+}
+
+/// A request's optional model override, validated against the
+/// allowlist — `None` falls through to the server's own configured
+/// default for that task (unaffected by this allowlist; the operator's
+/// own config isn't second-guessed, only what an author can request).
+pub fn resolve_ai_model<'a>(requested: Option<&'a str>, default: &'a str) -> Result<&'a str, AppError> {
+    match requested {
+        None => Ok(default),
+        Some(model) if is_allowed_ai_model(model) => Ok(model),
+        Some(model) => Err(AppError::UnprocessableEntity("model_not_allowed", format!("model \"{model}\" tidak diizinkan"))),
+    }
+}
+
 // P29-001 finding: a hardcoded maxTokens guess was found live to be far
 // too small for a reasoning-capable model that can burn its entire
 // budget on hidden reasoning before writing any visible answer.
@@ -126,11 +160,27 @@ async fn fetch_model_max_tokens() -> anyhow::Result<HashMap<String, i64>> {
     Ok(map)
 }
 
+// Capped at `fallback`, not just floored by it: `fallback` is each
+// caller's own estimate of how much output THIS task could ever need
+// (900 for a live-chat turn, 32_000 for a full lesson plan). The
+// model's own ceiling (e.g. 384_000 for deepseek-v4.1-flash) is an
+// upper bound on what the model CAN return, not a hint about what a
+// short task SHOULD request — asking for it anyway costs nothing per
+// se, but risks tripping a provider-side budget/quota check for no
+// benefit. `min` keeps every call's own accounting honest.
+//
+// Pulled out of `resolve_max_tokens` as its own pure function so this
+// decision is unit-testable without a real OpenRouter fetch — only the
+// network+cache half below is not worth mocking.
+fn capped_max_tokens(model_max: Option<i64>, fallback: i64) -> i64 {
+    model_max.map_or(fallback, |model_max| model_max.min(fallback))
+}
+
 // Falls back to `fallback` if the model isn't in OpenRouter's list or the
 // lookup itself fails — never fails the caller's generation attempt.
 pub async fn resolve_max_tokens(model: &str, fallback: i64) -> i64 {
     match MODEL_MAX_TOKENS.get_or_try_init(fetch_model_max_tokens).await {
-        Ok(map) => map.get(model).copied().unwrap_or(fallback),
+        Ok(map) => capped_max_tokens(map.get(model).copied(), fallback),
         Err(e) => {
             tracing::warn!(error = ?e, "resolveMaxTokens: OpenRouter /models lookup failed, using fallback");
             fallback
@@ -150,7 +200,19 @@ pub struct DeepSeekProvider {
 
 impl DeepSeekProvider {
     pub fn new(api_key: String) -> Self {
-        Self { api_key, client: reqwest::Client::new() }
+        // No timeout at all previously — a stalled OpenRouter connection
+        // hung the request (and the caller's spinner) forever. 240s
+        // comfortably covers the slowest real call today (a full-module
+        // generation, documented as "1-3 minutes" to the author) with
+        // room to spare; connect_timeout is separate and much shorter
+        // since a dead connection should fail fast, not eat into the
+        // generation budget.
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(240))
+            .build()
+            .expect("reqwest client with static timeout config never fails to build");
+        Self { api_key, client }
     }
 }
 
@@ -384,5 +446,62 @@ impl AIProvider for FakeAIProvider {
     // path; add one if/when a real caller needs it.
     async fn synthesize_speech(&self, _text: &str, _voice: &str, _model: &str) -> Result<SpeechResult, AIProviderError> {
         Ok(SpeechResult { bytes: vec![0, 1, 2, 3], content_type: "audio/mpeg".to_string() })
+    }
+}
+
+/// Test double for Phase 38's "retry once" behavior: `generate()` fails
+/// the first `fail_times` calls, then returns `success_text` from then
+/// on — so a caller's retry loop can be proven to clear exactly that
+/// much flakiness (and no more). An atomic counter, not a `Cell`,
+/// because `AIProvider` is `Send + Sync` and called through `&dyn`
+/// across await points. Public (not `#[cfg(test)]`) for the same reason
+/// `FakeAIProvider` is — integration tests in `tests/*.rs` build an
+/// `AppState` with it directly.
+pub struct FlakyThenSuccessProvider {
+    fail_times: usize,
+    calls_so_far: std::sync::atomic::AtomicUsize,
+    success_text: String,
+}
+
+impl FlakyThenSuccessProvider {
+    pub fn new(fail_times: usize, success_text: impl Into<String>) -> Self {
+        Self { fail_times, calls_so_far: std::sync::atomic::AtomicUsize::new(0), success_text: success_text.into() }
+    }
+}
+
+#[async_trait::async_trait]
+impl AIProvider for FlakyThenSuccessProvider {
+    async fn generate(&self, _req: GenerationRequest) -> Result<GenerationResponse, AIProviderError> {
+        let call_index = self.calls_so_far.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if call_index < self.fail_times {
+            Err(AIProviderError("simulated transient provider failure".to_string()))
+        } else {
+            Ok(GenerationResponse { text: self.success_text.clone(), tokens_used: Some(7) })
+        }
+    }
+
+    async fn transcribe(&self, _audio: &[u8], _mime_type: &str, _model: &str) -> Result<TranscriptionResult, AIProviderError> {
+        Ok(TranscriptionResult { text: "unused".to_string() })
+    }
+
+    async fn synthesize_speech(&self, _text: &str, _voice: &str, _model: &str) -> Result<SpeechResult, AIProviderError> {
+        Ok(SpeechResult { bytes: vec![], content_type: "audio/mpeg".to_string() })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capped_max_tokens_prefers_the_smaller_of_the_two() {
+        // The model can return far more than this task ever needs —
+        // stay capped at the caller's own estimate.
+        assert_eq!(capped_max_tokens(Some(384_000), 900), 900);
+        // The model's real ceiling is smaller than what was asked for —
+        // that's the actual limit now, not the caller's optimistic guess.
+        assert_eq!(capped_max_tokens(Some(500), 32_000), 500);
+        // Model not found in OpenRouter's list — fall through untouched.
+        assert_eq!(capped_max_tokens(None, 16_000), 16_000);
     }
 }

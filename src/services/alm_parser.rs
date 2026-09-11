@@ -103,6 +103,53 @@ pub fn parse(source: &str) -> Result<Vec<ParsedBlock>, AppError> {
             continue;
         }
 
+        // Fenced code — ```lang ... ```. Informatika lessons need real
+        // code, and TipTap's native codeBlock node round-trips to this.
+        if let Some(language) = code_fence_open(line) {
+            let start = i;
+            let body_start = i + 1;
+            let mut body_end = lines.len();
+            let mut j = body_start;
+            while j < lines.len() {
+                if lines[j].trim_start().starts_with("```") {
+                    body_end = j;
+                    break;
+                }
+                j += 1;
+            }
+            let code = lines[body_start..body_end.min(lines.len())].join("\n");
+            blocks.push(ParsedBlock {
+                r#type: "code".to_string(),
+                data: serde_json::json!({ "language": language, "code": code }),
+                raw_source: lines[start..(body_end + 1).min(lines.len())].join("\n"),
+            });
+            i = (body_end + 1).min(lines.len());
+            continue;
+        }
+
+        // Bullet / numbered lists. Consecutive marker lines fold into one
+        // block; before this they fell through to the paragraph branch and
+        // were silently flattened into prose.
+        if let Some((ordered, _)) = list_item(line) {
+            let start = i;
+            let mut items = Vec::new();
+            while i < lines.len() {
+                match list_item(lines[i]) {
+                    Some((is_ordered, text)) if is_ordered == ordered => {
+                        items.push(serde_json::Value::String(text));
+                        i += 1;
+                    }
+                    _ => break,
+                }
+            }
+            blocks.push(ParsedBlock {
+                r#type: "list".to_string(),
+                data: serde_json::json!({ "ordered": ordered, "items": items }),
+                raw_source: lines[start..i].join("\n"),
+            });
+            continue;
+        }
+
         if let Some((alt, asset)) = image_syntax(line) {
             blocks.push(ParsedBlock {
                 r#type: "image".to_string(),
@@ -124,6 +171,8 @@ pub fn parse(source: &str) -> Result<Vec<ParsedBlock>, AppError> {
                 || l.trim_start().starts_with('>')
                 || heading_text(l).is_some()
                 || image_syntax(l).is_some()
+                || code_fence_open(l).is_some()
+                || list_item(l).is_some()
             {
                 break;
             }
@@ -142,6 +191,31 @@ pub fn parse(source: &str) -> Result<Vec<ParsedBlock>, AppError> {
 
 fn count_leading_hashes(line: &str) -> usize {
     line.trim_start().chars().take_while(|&c| c == '#').count()
+}
+
+// ```` ```python ```` opens a fenced code block; the info string (may be
+// empty) is the language.
+fn code_fence_open(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix("```")?;
+    Some(rest.trim().to_string())
+}
+
+// `- item` / `* item` (unordered) or `1. item` (ordered). Returns
+// (ordered, text).
+fn list_item(line: &str) -> Option<(bool, String)> {
+    let trimmed = line.trim_start();
+    for marker in ["- ", "* "] {
+        if let Some(rest) = trimmed.strip_prefix(marker) {
+            return Some((false, rest.trim().to_string()));
+        }
+    }
+    let digits: String = trimmed.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let rest = trimmed[digits.len()..].strip_prefix(". ")?;
+    Some((true, rest.trim().to_string()))
 }
 
 fn heading_text(line: &str) -> Option<(String, u32)> {
@@ -177,11 +251,89 @@ fn parse_key_value_body(lines: &[&str]) -> serde_json::Value {
         }
         let Some(colon_index) = line.find(':') else { continue };
         let key = line[..colon_index].trim().to_string();
-        let mut value = line[colon_index + 1..].trim().to_string();
-        if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
-            value = value[1..value.len() - 1].to_string();
-        }
-        map.insert(key, serde_json::Value::String(value));
+        let value = line[colon_index + 1..].trim();
+        map.insert(key, parse_scalar(value));
     }
     serde_json::to_value(map).unwrap()
+}
+
+// A directive field is usually a plain string, but the structured blocks
+// (a table's rows, a timeline's entries, a list's items) need real
+// arrays. Anything that parses as a JSON array or object is stored as
+// one; everything else stays a string, so ordinary prose containing a
+// stray bracket is never mangled into JSON.
+fn parse_scalar(value: &str) -> serde_json::Value {
+    if (value.starts_with('[') && value.ends_with(']')) || (value.starts_with('{') && value.ends_with('}')) {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(value) {
+            return parsed;
+        }
+    }
+    let unquoted = if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') { &value[1..value.len() - 1] } else { value };
+    serde_json::Value::String(unquoted.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn types(source: &str) -> Vec<String> {
+        parse(source).unwrap().iter().map(|b| b.r#type.clone()).collect()
+    }
+
+    #[test]
+    fn bullet_and_numbered_lists_become_list_blocks() {
+        // Before this they fell through to the paragraph branch and were
+        // flattened into one line of prose, losing the list entirely.
+        let blocks = parse("- satu\n- dua\n\n1. pertama\n2. kedua").unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].r#type, "list");
+        assert_eq!(blocks[0].data, json!({"ordered": false, "items": ["satu", "dua"]}));
+        assert_eq!(blocks[1].data, json!({"ordered": true, "items": ["pertama", "kedua"]}));
+    }
+
+    #[test]
+    fn an_ordered_and_unordered_run_do_not_merge() {
+        let blocks = parse("- satu\n1. dua").unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].data["ordered"], json!(false));
+        assert_eq!(blocks[1].data["ordered"], json!(true));
+    }
+
+    #[test]
+    fn fenced_code_keeps_its_language_and_indentation() {
+        let blocks = parse("```python\ndef f():\n    return 1\n```").unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].r#type, "code");
+        assert_eq!(blocks[0].data["language"], json!("python"));
+        assert_eq!(blocks[0].data["code"], json!("def f():\n    return 1"));
+    }
+
+    #[test]
+    fn directive_values_that_are_json_parse_as_json() {
+        let blocks = parse(":::table\nheaders: [\"Unsur\", \"Simbol\"]\nrows: [[\"Hidrogen\", \"H\"]]\ncaption: Tabel unsur\n:::").unwrap();
+        assert_eq!(blocks[0].data["headers"], json!(["Unsur", "Simbol"]));
+        assert_eq!(blocks[0].data["rows"], json!([["Hidrogen", "H"]]));
+        assert_eq!(blocks[0].data["caption"], json!("Tabel unsur"));
+    }
+
+    #[test]
+    fn prose_containing_a_bracket_is_not_mangled_into_json() {
+        let blocks = parse(":::callout\ntext: Perhatikan [catatan kaki] di bawah\n:::").unwrap();
+        assert_eq!(blocks[0].data["text"], json!("Perhatikan [catatan kaki] di bawah"));
+    }
+
+    #[test]
+    fn a_hyphen_in_prose_does_not_start_a_list() {
+        // "-5 derajat" has no space after the hyphen, so it stays prose.
+        assert_eq!(types("-5 derajat celsius"), vec!["text"]);
+    }
+
+    #[test]
+    fn existing_syntax_still_parses_unchanged() {
+        assert_eq!(
+            types("# Judul\nParagraf\n> kutipan\n![a](asset://x)\n:::flashcard\nfront: a\nback: b\n:::"),
+            vec!["heading", "text", "example", "image", "flashcard"]
+        );
+    }
 }

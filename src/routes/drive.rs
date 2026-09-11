@@ -1,4 +1,5 @@
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{get, post},
     Router,
 };
@@ -10,10 +11,32 @@ use crate::state::AppState;
 // Assets (P1-010/P2-010) + Drive (folders/sharing/activity/trash). All
 // protected — every route requires a bearer token, no public routes
 // here.
+/// A little over ASSET_MAX_BYTES's 25 MB default, leaving room for
+/// multipart framing so the handler — not the extractor — is what
+/// rejects an oversize file.
+const UPLOAD_BODY_LIMIT: usize = 32 * 1024 * 1024;
+
 pub fn protected_routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/assets", post(handlers::asset::post_upload).get(handlers::asset::get_assets))
-        .route("/assets/upload", post(handlers::asset::post_upload))
+        // Axum caps request bodies at 2 MB by default. Upload routes have
+        // to opt out, or a 3 MB recording dies inside the multipart
+        // extractor as "invalid_multipart" — a confusing 422 that never
+        // reaches the handler's own `file_too_large` check, and makes the
+        // configured ASSET_MAX_BYTES (25 MB) a lie.
+        //
+        // The limit here is deliberately a little above that ceiling so
+        // an oversize file is refused by the handler, which can say WHY,
+        // rather than by the extractor, which cannot.
+        .route(
+            "/assets",
+            post(handlers::asset::post_upload)
+                .get(handlers::asset::get_assets)
+                .layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)),
+        )
+        .route(
+            "/assets/upload",
+            post(handlers::asset::post_upload).layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)),
+        )
         .route("/assets/presigned-upload", post(handlers::asset::post_presigned_upload))
         .route("/assets/confirm", post(handlers::asset::post_confirm))
         .route("/assets/{id}", get(handlers::asset::get_asset).delete(handlers::asset::delete_asset))

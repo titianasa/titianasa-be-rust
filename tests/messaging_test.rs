@@ -52,6 +52,8 @@ fn test_config() -> Config {
         ai_ocr_model: "test-model".into(),
         ai_tts_model: "test-model".into(),
         redis_url: "redis://127.0.0.1:6379".into(),
+        collab_checkpoint_interval_seconds: 15,
+        ai_live_chat_model: "~deepseek/deepseek-v4-flash-latest".into(),
     }
 }
 
@@ -66,6 +68,7 @@ fn build_app(pool: PgPool) -> axum::Router {
         meeting_provider: Arc::new(titian_backend_rust::services::meeting_provider::StubMeetingProvider),
         storage: Arc::new(titian_backend_rust::services::storage::InMemoryStorage::new()),
         canvas_hub: Arc::new(titian_backend_rust::services::canvas_hub::CanvasHub::new()),
+        collab_hub: Arc::new(titian_backend_rust::services::collab_hub::CollabHub::new()),
     });
     routes::create_router(state)
 }

@@ -6,6 +6,7 @@ use crate::errors::AppError;
 use crate::models::auth::AuthContext;
 use crate::models::responses::assessment::AssessmentSummary;
 use crate::services::permissions::{require_permission, Action, Resource};
+use crate::services::quiz_config_schema;
 
 pub struct NewAssessment {
     pub r#type: String,
@@ -161,11 +162,14 @@ pub struct CreateLessonAttemptResponse {
 pub async fn create_lesson_attempt(pool: &PgPool, ctx: &AuthContext, item_id: Uuid) -> Result<CreateLessonAttemptResponse, AppError> {
     require_permission(ctx, Resource::Attempt, Action::Create)?;
 
-    let item = sqlx::query!(r#"select content_type, status from module_items where id = $1"#, item_id).fetch_optional(pool).await?;
+    let item = sqlx::query!(r#"select content_type, status, quiz_config from module_items where id = $1"#, item_id).fetch_optional(pool).await?;
     let Some(item) = item else { return Err(AppError::NotFound("module_item_not_found")) };
-    let content_type = item.content_type.as_deref();
-    if content_type != Some("writing") && content_type != Some("speaking") {
-        return Err(AppError::UnprocessableEntity("invalid_lesson_type", r#"module_item.content_type must be "writing" or "speaking""#.to_string()));
+    // Phase 37 — an "attempt" only ever applies to a quiz item now
+    // (an article has no submission concept). Canvas sessions
+    // (canvas.rs::submit_session) reuse this same call for their
+    // essay-subtype quiz items.
+    if item.content_type.as_deref() != Some("quiz") {
+        return Err(AppError::UnprocessableEntity("invalid_lesson_type", r#"module_item.content_type must be "quiz""#.to_string()));
     }
     if item.status != "published" {
         return Err(AppError::ForbiddenWithCode("lesson_not_published"));
@@ -176,18 +180,27 @@ pub async fn create_lesson_attempt(pool: &PgPool, ctx: &AuthContext, item_id: Uu
         return Err(AppError::AttemptAlreadyInProgress(existing_id));
     }
 
+    // Phase 38 — "Maks. Percobaan": `quiz_config.max_attempts` caps how
+    // many times a learner may ever START this quiz. Absent/None keeps
+    // today's behavior (unlimited). A malformed quiz_config is not this
+    // check's job to reject — that's PATCH's job — so it's treated the
+    // same as "no cap" rather than blocking every attempt.
+    if let Some(max_attempts) = item.quiz_config.as_ref().and_then(|raw| quiz_config_schema::parse(raw).ok()).and_then(|quiz| quiz.max_attempts) {
+        let attempt_count = sqlx::query_scalar!(r#"select count(*) as "count!" from attempts where user_id = $1 and item_id = $2"#, ctx.user_id, item_id).fetch_one(pool).await?;
+        if attempt_count >= max_attempts {
+            return Err(AppError::UnprocessableEntity(
+                "max_attempts_reached",
+                format!("kamu sudah mencapai batas maksimal {max_attempts} percobaan untuk kuis ini"),
+            ));
+        }
+    }
+
     let attempt = sqlx::query!(r#"insert into attempts (user_id, item_id) values ($1, $2) returning id, status"#, ctx.user_id, item_id).fetch_one(pool).await?;
     Ok(CreateLessonAttemptResponse { attempt_id: attempt.id, status: attempt.status })
 }
 
 pub async fn submit_lesson_attempt(pool: &PgPool, attempt_id: Uuid, answer_text: &str) -> Result<(), AppError> {
     let answers = serde_json::json!({"text": answer_text});
-    sqlx::query!(r#"update attempts set answers = $2, status = 'submitted', submitted_at = now() where id = $1"#, attempt_id, answers).execute(pool).await?;
-    Ok(())
-}
-
-pub async fn submit_speaking_lesson_attempt(pool: &PgPool, attempt_id: Uuid, audio_asset_id: Uuid) -> Result<(), AppError> {
-    let answers = serde_json::json!({"audio_asset_id": audio_asset_id});
     sqlx::query!(r#"update attempts set answers = $2, status = 'submitted', submitted_at = now() where id = $1"#, attempt_id, answers).execute(pool).await?;
     Ok(())
 }
