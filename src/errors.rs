@@ -57,6 +57,11 @@ pub enum AppError {
     // when an uploaded file exceeds config.asset_max_bytes.
     #[error("payload_too_large")]
     PayloadTooLarge(&'static str),
+    // P39-005 — 429, `client_events::check_rate_limit` when one user's
+    // `POST /events` batches exceed the per-minute ceiling. The first
+    // (and so far only) 429 in this codebase.
+    #[error("too_many_requests")]
+    TooManyRequests(&'static str),
     // Port of error.ts's aiOutputValidationFailed — 422. Originally a
     // dedicated no-detail factory; now carries the real underlying
     // reason (the provider's own error, or why the output couldn't be
@@ -117,6 +122,7 @@ impl IntoResponse for AppError {
             }
             AppError::BadGateway(code, detail) => (StatusCode::BAD_GATEWAY, json!({"error": code, "detail": detail})),
             AppError::PayloadTooLarge(code) => (StatusCode::PAYLOAD_TOO_LARGE, json!({"error": code, "detail": null})),
+            AppError::TooManyRequests(code) => (StatusCode::TOO_MANY_REQUESTS, json!({"error": code, "detail": null})),
             AppError::AiOutputValidationFailed(detail) => (StatusCode::UNPROCESSABLE_ENTITY, json!({"error": "ai_output_validation_failed", "detail": detail})),
             // A unique-key clash is the CALLER re-sending a value that
             // already exists (e.g. modules.code), not a server fault —

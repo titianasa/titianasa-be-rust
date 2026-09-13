@@ -348,6 +348,24 @@ pub async fn get_pending_reviews(State(state): State<Arc<AppState>>, Extension(c
     Ok(Json(crate::services::quiz_attempt::list_pending_reviews(&state.db, &ctx, id).await?))
 }
 
+// GET /module-items/{id}/versions — P39-002.
+pub async fn get_item_versions(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<crate::services::module_item_version::VersionSummary>>, AppError> {
+    Ok(Json(crate::services::module_item_version::list(&state.db, &ctx, id).await?))
+}
+
+// GET /module-items/{id}/versions/{version}
+pub async fn get_item_version(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
+    Path((id, version)): Path<(Uuid, i32)>,
+) -> Result<Json<crate::services::module_item_version::VersionDetail>, AppError> {
+    Ok(Json(crate::services::module_item_version::get(&state.db, &ctx, id, version).await?))
+}
+
 // GET /module-items/{id}/speaking-prompt-audio — returns raw audio
 // bytes, not JSON, matching speaking_room.rs's post_tts precedent.
 pub async fn get_speaking_prompt_audio(State(state): State<Arc<AppState>>, Extension(ctx): Extension<AuthContext>, Path(id): Path<Uuid>) -> Result<Response, AppError> {

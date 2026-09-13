@@ -65,6 +65,7 @@ fn test_config() -> Config {
         ai_live_chat_model: "test-model".into(),
         gcp_project_id: "test-gcp-project".into(),
         gcp_region: "us-central1".into(),
+        consent_guardian_confirmation_required: false,
     }
 }
 

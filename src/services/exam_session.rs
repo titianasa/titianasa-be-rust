@@ -79,6 +79,18 @@ pub async fn start_exam_session(pool: &PgPool, ctx: &AuthContext, assessment_id:
     let duration_minutes = read_duration_minutes(&config);
     let deadline = compute_deadline(session.started_at, duration_minutes);
 
+    // P39-004 — an exam session IS the "tryout" context by definition
+    // (ADR-0013 §1.5); `session_id` is what that column exists for.
+    let mut event = crate::services::learning_event::NewLearningEvent::server(
+        "exam_session_started",
+        "exam_session",
+        session.id,
+        serde_json::json!({"assessment_id": assessment_id, "deadline": deadline}),
+        "tryout",
+    );
+    event.session_id = Some(session.id);
+    crate::services::learning_event::record(pool, ctx.user_id, crate::services::learning_event::EventChannel::Server, event).await?;
+
     Ok(StartExamSessionResponse { exam_session_id: session.id, attempt_id: attempt.attempt_id, status: session.status, deadline, questions: attempt.questions })
 }
 
@@ -136,5 +148,10 @@ pub async fn record_submission(pool: &PgPool, assessment_id: Uuid, user_id: Uuid
     let timed_out = deadline.map(|d| submitted_at > d).unwrap_or(false);
     let status = if timed_out { "timed_out" } else { "submitted" };
     sqlx::query!(r#"update exam_sessions set status = $2, submitted_at = $3 where id = $1"#, session.id, status, submitted_at).execute(pool).await?;
+
+    let mut event = crate::services::learning_event::NewLearningEvent::server("exam_session_finished", "exam_session", session.id, serde_json::json!({"status": status, "timed_out": timed_out}), "tryout");
+    event.session_id = Some(session.id);
+    crate::services::learning_event::record(pool, user_id, crate::services::learning_event::EventChannel::Server, event).await?;
+
     Ok(())
 }

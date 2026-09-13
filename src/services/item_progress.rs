@@ -25,7 +25,16 @@ pub struct Progress {
 
 /// Records a finished item. Never un-finishes one, and never lowers a
 /// best score — retaking a quiz badly does not re-lock what it unlocked.
-pub async fn record_completion(pool: &PgPool, user_id: Uuid, item_id: Uuid, score: Option<f64>) -> Result<(), AppError> {
+///
+/// P39-004 (ADR-0013 L1) — also emits `module_item_completed`, every
+/// time this is called (not only on the FIRST completion): a repeat
+/// completion is still a real thing that happened, and the event log's
+/// job is to keep every occurrence, unlike this table's own upsert
+/// which only keeps the best one. `source` is the caller's own
+/// classification (ADR-0013 §1.5) — a quiz completing under a
+/// proctored sitting and a learner finishing reading an article are
+/// both "completion", but not the same kind of behaviour.
+pub async fn record_completion(pool: &PgPool, user_id: Uuid, item_id: Uuid, score: Option<f64>, source: &'static str) -> Result<(), AppError> {
     sqlx::query!(
         r#"insert into module_item_progress (user_id, item_id, completed_at, best_score)
            values ($1, $2, now(), $3)
@@ -39,6 +48,11 @@ pub async fn record_completion(pool: &PgPool, user_id: Uuid, item_id: Uuid, scor
     )
     .execute(pool)
     .await?;
+
+    let mut event = crate::services::learning_event::NewLearningEvent::server("module_item_completed", "module_item", item_id, serde_json::json!({"score": score}), source);
+    event.module_item_id = Some(item_id);
+    crate::services::learning_event::record(pool, user_id, crate::services::learning_event::EventChannel::Server, event).await?;
+
     Ok(())
 }
 

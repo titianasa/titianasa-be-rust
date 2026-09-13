@@ -1,4 +1,5 @@
 pub mod learning_profile;
+pub mod user_data_consent;
 pub mod ai;
 pub mod assessment;
 pub mod attendance;
@@ -17,7 +18,12 @@ pub mod program;
 pub mod question;
 pub mod speaking_room;
 
-use axum::{http::Method, middleware::from_fn_with_state, routing::get, Router};
+use axum::{
+    http::Method,
+    middleware::from_fn_with_state,
+    routing::{get, post},
+    Router,
+};
 use std::sync::Arc;
 use tower_http::{
     compression::CompressionLayer,
@@ -49,6 +55,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         ]));
 
     let protected = Router::new()
+        .route("/events", post(handlers::client_events::post_events))
         .merge(ai::protected_routes())
         .merge(auth::protected_routes())
         .merge(organization::protected_routes())
@@ -67,6 +74,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .merge(drive::protected_routes())
         .merge(messaging::protected_routes())
         .merge(proctoring::protected_routes())
+        .merge(user_data_consent::protected_routes())
         .layer(from_fn_with_state(state.clone(), auth_middleware));
 
     Router::new()

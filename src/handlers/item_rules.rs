@@ -54,7 +54,7 @@ pub async fn post_complete(State(state): State<Arc<AppState>>, Extension(ctx): E
     if item.content_type.as_deref() != Some("article") {
         return Err(AppError::UnprocessableEntity("not_an_article", "kuis selesai saat dikumpulkan, bukan lewat tombol ini".to_string()));
     }
-    item_progress::record_completion(&state.db, ctx.user_id, item_id, None).await?;
+    item_progress::record_completion(&state.db, ctx.user_id, item_id, None, "self_learning").await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

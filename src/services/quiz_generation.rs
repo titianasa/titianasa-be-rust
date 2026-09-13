@@ -412,6 +412,21 @@ fn merge_into_group(
             if let (Some(obj), Some(number)) = (replacement.as_object_mut(), target_number) {
                 obj.insert("number".to_string(), number_value(number));
             }
+            // P39-001 — the rewritten question is new content (its stem
+            // or answer may be entirely different), so it does NOT keep
+            // the old `uid` — `ensure_question_uids` assigns it a fresh
+            // one below. But its lineage is worth recording: without
+            // this, a question's whole statistical history vanishes the
+            // moment an author clicks "Tulis ulang".
+            if let Some(old_uid) = target_number
+                .and_then(|n| existing.iter().find(|q| value_to_key(q.get("number").unwrap_or(&serde_json::Value::Null)) == n))
+                .and_then(|q| q.get("uid"))
+                .cloned()
+            {
+                if let Some(obj) = replacement.as_object_mut() {
+                    obj.insert("derived_from_uid".to_string(), old_uid);
+                }
+            }
             existing
                 .into_iter()
                 .map(|q| {
@@ -849,6 +864,15 @@ pub async fn generate_quiz_group(
         return Err(AppError::AiOutputValidationFailed(Some("Model tidak mengembalikan soal apa pun.".to_string())));
     }
 
+    // P39-001 — the AI never emits `uid` itself (it doesn't know the
+    // concept), so every question the merge just wrote or touched gets
+    // one assigned here, in the SAME transaction as the save — the only
+    // place this write path can do it, since `next_config` is what
+    // actually lands in the row below.
+    let mut typed_config = quiz_config_schema::parse(&next_config)?;
+    crate::services::quiz_config::ensure_question_uids(&mut typed_config);
+    next_config = serde_json::to_value(&typed_config).map_err(|e| AppError::Internal(e.into()))?;
+
     // Refuse to save something the engine could not then dispatch — a
     // duplicate number or a dangling reference would corrupt every
     // attempt on this paper.
@@ -1203,6 +1227,24 @@ mod tests {
         assert_eq!(questions[0]["number"], json!(5));
         assert_eq!(questions[0]["stem"], json!("tulisan ulang"));
         assert_eq!(questions[1]["stem"], json!("lama B"), "the other question is untouched");
+    }
+
+    #[test]
+    fn rewrite_records_the_old_uid_as_derived_from_uid_and_does_not_keep_it_as_uid() {
+        // P39-001 — the rewritten question is new content, so it must
+        // NOT keep the old identity as its own `uid` (that would make
+        // pre- and post-rewrite statistics indistinguishable), but the
+        // lineage back to the question it replaced has to survive
+        // somewhere, or a rewrite silently erases a question's history.
+        let old_uid = "11111111-1111-1111-1111-111111111111";
+        let mut group = json!({"group_id": "g", "type": "multiple_choice", "questions": [
+            {"number": 5, "stem": "lama", "uid": old_uid},
+        ]});
+        let generated = json!({"questions": [{"number": 1, "stem": "tulisan ulang"}]});
+        merge_into_group(&mut group, &generated, &[], 7, GenerationMode::Rewrite, Some("5"));
+        let rewritten = &group["questions"][0];
+        assert_eq!(rewritten["derived_from_uid"], json!(old_uid));
+        assert!(rewritten.get("uid").is_none(), "a fresh uid is assigned later by ensure_question_uids, not here");
     }
 
     #[test]

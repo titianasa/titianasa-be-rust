@@ -57,6 +57,13 @@ pub struct Config {
     // OpenRouter). See `services::vertex_ai_provider`.
     pub gcp_project_id: String,
     pub gcp_region: String,
+    // P39-007 — whether an SD/SMP-jenjang learner's consent grant
+    // (`user_data_consent::set_consent`) requires `guardian_confirmed`.
+    // `false` during the current uji coba (pilot) phase per explicit
+    // user instruction ("untuk anak, di uji coba allow aja") — the
+    // mechanism stays fully built, just not enforced yet, so turning it
+    // on for a real launch is a config flip, not new code.
+    pub consent_guardian_confirmation_required: bool,
 }
 
 impl Config {
@@ -108,6 +115,7 @@ impl Config {
             ai_live_chat_model: std::env::var("AI_LIVE_CHAT_MODEL").unwrap_or_else(|_| "gemini-3.8-flash".into()),
             gcp_project_id: std::env::var("GCP_PROJECT_ID").context("GCP_PROJECT_ID is required")?,
             gcp_region: std::env::var("GCP_REGION").unwrap_or_else(|_| "global".into()),
+            consent_guardian_confirmation_required: env_bool("CONSENT_GUARDIAN_CONFIRMATION_REQUIRED", false)?,
         })
     }
 }
@@ -122,6 +130,13 @@ fn env_int(key: &str, default: i64) -> anyhow::Result<i64> {
 fn env_float(key: &str, default: f64) -> anyhow::Result<f64> {
     match std::env::var(key) {
         Ok(v) => v.parse().with_context(|| format!("{key} must be a valid number")),
+        Err(_) => Ok(default),
+    }
+}
+
+fn env_bool(key: &str, default: bool) -> anyhow::Result<bool> {
+    match std::env::var(key) {
+        Ok(v) => v.parse().with_context(|| format!("{key} must be \"true\" or \"false\"")),
         Err(_) => Ok(default),
     }
 }

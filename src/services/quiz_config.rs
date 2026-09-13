@@ -22,6 +22,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uuid::Uuid;
 
 /// A cell/step/heading entry that may be given either as a bare string or
 /// as `{label, text}`. Parelabs' generators emit both forms depending on
@@ -222,6 +223,25 @@ pub struct QuizQuestion {
     /// map uses. A string is allowed for multi-mark ranges like "5-6".
     pub number: Value,
 
+    /// P39-001 (ADR-0013 L1) — a permanent identity for this question,
+    /// distinct from `number`. `number` is a display label the author
+    /// (or a delete-and-renumber) can freely change; every event and
+    /// statistic that needs to keep pointing at the SAME question across
+    /// reorders, renumbers, and edits keys off `uid` instead. Server-
+    /// assigned (`ensure_question_uids`) the moment a question is first
+    /// saved — never set by an author or the AI generator directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<Uuid>,
+    /// Set only when this question was produced by rewriting another
+    /// one (`GenerationMode::Rewrite`) — the `uid` of the question it
+    /// replaced. A rewritten question is new content (its stem/answer
+    /// may be entirely different), so it gets its OWN `uid` rather than
+    /// inheriting the old one; this field is what lets statistics on the
+    /// old version be told apart from the new one while still tracing
+    /// the lineage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_from_uid: Option<Uuid>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stem: Option<String>,
     /// Alias for `stem` — true_false content is authored with `text`.
@@ -391,6 +411,39 @@ pub fn value_to_key(value: &Value) -> String {
         }
         other => other.to_string(),
     }
+}
+
+/// P39-001 — gives every question in the deck a stable `uid`: assigns a
+/// fresh one to any question that doesn't have one yet, and ALSO to any
+/// question whose `uid` collides with one already seen earlier in the
+/// same deck (a group or question duplicated client-side before this
+/// existed copies the `uid` along with everything else — the second
+/// copy needs its own identity, not to share the first's). Returns
+/// whether anything changed, so a caller (the backfill binary) can skip
+/// writing back a config that was already clean.
+///
+/// Deliberately does NOT touch `number` or `derived_from_uid` — this is
+/// the one function responsible for identity, called from every path
+/// that can introduce a question into stored `quiz_config` (an
+/// author's save, the AI generator's merge, and the one-time backfill).
+pub fn ensure_question_uids(config: &mut QuizConfig) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    let mut changed = false;
+    for group in &mut config.question_groups {
+        for question in &mut group.questions {
+            let needs_new = match question.uid {
+                Some(uid) => !seen.insert(uid),
+                None => true,
+            };
+            if needs_new {
+                let fresh = Uuid::new_v4();
+                question.uid = Some(fresh);
+                seen.insert(fresh);
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 /// A shared context plus the questions drawn from it.
@@ -741,5 +794,81 @@ mod tests {
         assert_eq!(group.options[0].text(), "plain string");
         assert_eq!(group.options[1].text(), "labelled");
         assert_eq!(group.options[1].label(), Some("A"));
+    }
+
+    #[test]
+    fn ensure_question_uids_assigns_one_to_every_question_missing_it() {
+        let mut config: QuizConfig = serde_json::from_value(json!({
+            "sections": [],
+            "question_groups": [{
+                "group_id": "g1", "type": "multiple_choice",
+                "questions": [{"number": 1, "stem": "a"}, {"number": 2, "stem": "b"}],
+            }],
+        }))
+        .unwrap();
+        assert!(config.question_groups[0].questions.iter().all(|q| q.uid.is_none()));
+
+        let changed = ensure_question_uids(&mut config);
+        assert!(changed);
+        let uids: Vec<Uuid> = config.question_groups[0].questions.iter().map(|q| q.uid.unwrap()).collect();
+        assert_ne!(uids[0], uids[1], "two different questions must get two different uids");
+    }
+
+    #[test]
+    fn ensure_question_uids_leaves_an_already_unique_uid_alone() {
+        let existing = Uuid::new_v4();
+        let mut config: QuizConfig = serde_json::from_value(json!({
+            "sections": [],
+            "question_groups": [{
+                "group_id": "g1", "type": "multiple_choice",
+                "questions": [{"number": 1, "stem": "a", "uid": existing}],
+            }],
+        }))
+        .unwrap();
+
+        let changed = ensure_question_uids(&mut config);
+        assert!(!changed, "a question that already has a unique uid must not be touched");
+        assert_eq!(config.question_groups[0].questions[0].uid, Some(existing));
+    }
+
+    #[test]
+    fn ensure_question_uids_reassigns_the_second_of_two_duplicated_uids() {
+        // The real scenario: a whole group gets duplicated client-side
+        // (before the frontend was taught to strip uid on copy) and both
+        // copies arrive at the server sharing one uid.
+        let dup = Uuid::new_v4();
+        let mut config: QuizConfig = serde_json::from_value(json!({
+            "sections": [],
+            "question_groups": [
+                {"group_id": "g1", "type": "multiple_choice", "questions": [{"number": 1, "stem": "original", "uid": dup}]},
+                {"group_id": "g2", "type": "multiple_choice", "questions": [{"number": 2, "stem": "copy", "uid": dup}]},
+            ],
+        }))
+        .unwrap();
+
+        let changed = ensure_question_uids(&mut config);
+        assert!(changed);
+        let first = config.question_groups[0].questions[0].uid.unwrap();
+        let second = config.question_groups[1].questions[0].uid.unwrap();
+        assert_eq!(first, dup, "the first occurrence keeps the original identity");
+        assert_ne!(second, dup, "the second occurrence must not keep sharing it");
+    }
+
+    #[test]
+    fn ensure_question_uids_never_touches_number_or_derived_from_uid() {
+        let lineage = Uuid::new_v4();
+        let mut config: QuizConfig = serde_json::from_value(json!({
+            "sections": [],
+            "question_groups": [{
+                "group_id": "g1", "type": "multiple_choice",
+                "questions": [{"number": "5-6", "stem": "a", "derived_from_uid": lineage}],
+            }],
+        }))
+        .unwrap();
+
+        ensure_question_uids(&mut config);
+        let q = &config.question_groups[0].questions[0];
+        assert_eq!(value_to_key(&q.number), "5-6");
+        assert_eq!(q.derived_from_uid, Some(lineage));
     }
 }

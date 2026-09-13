@@ -44,6 +44,10 @@ struct ItemRow {
     // Only one dedicated endpoint (update_subject) ever writes this;
     // every other ItemRow query here selects it read-only, unchanged.
     subject_id: Option<Uuid>,
+    // P39-002 — only `publish` actually reads this (to freeze a
+    // version); every other caller of `find_by_id` ignores it, same as
+    // they already ignore `quiz_config` most of the time.
+    lesson_plan: Option<serde_json::Value>,
 }
 
 // Phase 37 — collapsed from the old 6 English-learning-specific values
@@ -79,7 +83,7 @@ pub async fn find_status(pool: &PgPool, item_id: Uuid) -> Result<Option<String>,
 async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<ItemRow>, AppError> {
     let row = sqlx::query_as!(
         ItemRow,
-        r#"select id, module_id, parent_id, node_type, depth, title, content_type, quiz_config, status, qa_report, generated_by, subject_id
+        r#"select id, module_id, parent_id, node_type, depth, title, content_type, quiz_config, status, qa_report, generated_by, subject_id, lesson_plan
            from module_items where id = $1"#,
         id,
     )
@@ -242,7 +246,7 @@ pub async fn create_with_provenance(pool: &PgPool, ctx: &AuthContext, module_id:
         ItemRow,
         r#"insert into module_items (module_id, parent_id, node_type, depth, title, content_type, quiz_config, generated_by, subject_id)
            values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-           returning id, module_id, parent_id, node_type, depth, title, content_type, quiz_config, status, qa_report, generated_by, subject_id"#,
+           returning id, module_id, parent_id, node_type, depth, title, content_type, quiz_config, status, qa_report, generated_by, subject_id, lesson_plan"#,
         module_id,
         req.parent_id,
         req.node_type,
@@ -363,7 +367,7 @@ pub async fn update_meta(pool: &PgPool, ctx: &AuthContext, id: Uuid, req: Update
     let row = sqlx::query_as!(
         ItemRow,
         r#"update module_items set title = $2, parent_id = $3, depth = $4, updated_at = now() where id = $1
-           returning id, module_id, parent_id, node_type, depth, title, content_type, quiz_config, status, qa_report, generated_by, subject_id"#,
+           returning id, module_id, parent_id, node_type, depth, title, content_type, quiz_config, status, qa_report, generated_by, subject_id, lesson_plan"#,
         id,
         title,
         new_parent_id,
@@ -390,7 +394,7 @@ pub async fn update_subject(pool: &PgPool, ctx: &AuthContext, id: Uuid, subject_
     let row = sqlx::query_as!(
         ItemRow,
         r#"update module_items set subject_id = $2, updated_at = now() where id = $1
-           returning id, module_id, parent_id, node_type, depth, title, content_type, quiz_config, status, qa_report, generated_by, subject_id"#,
+           returning id, module_id, parent_id, node_type, depth, title, content_type, quiz_config, status, qa_report, generated_by, subject_id, lesson_plan"#,
         id,
         subject_id,
     )
@@ -461,12 +465,21 @@ pub async fn update_quiz_config(pool: &PgPool, ctx: &AuthContext, item_id: Uuid,
         return Err(AppError::UnprocessableEntity("not_a_quiz_item", "quiz_config can only be set on a content_type=\"quiz\" item".to_string()));
     }
 
+    // P39-001 — every question gets a permanent `uid` the moment it's
+    // saved, regardless of whether the client sent one. This is the
+    // single choke point every quiz save (manual edit, template apply,
+    // document import) passes through, so it's the one place this needs
+    // to happen for the author-facing path (the AI generator's own
+    // write path calls the same function — see quiz_generation.rs).
+    let mut parsed = crate::services::quiz_config_schema::parse(&quiz_config)?;
+    crate::services::quiz_config::ensure_question_uids(&mut parsed);
+    let quiz_config = serde_json::to_value(&parsed).map_err(|e| AppError::Internal(e.into()))?;
     crate::services::quiz_config_schema::validate_structure(&quiz_config)?;
 
     let row = sqlx::query_as!(
         ItemRow,
         r#"update module_items set quiz_config = $2, updated_at = now() where id = $1
-           returning id, module_id, parent_id, node_type, depth, title, content_type, quiz_config, status, qa_report, generated_by, subject_id"#,
+           returning id, module_id, parent_id, node_type, depth, title, content_type, quiz_config, status, qa_report, generated_by, subject_id, lesson_plan"#,
         item_id,
         quiz_config,
     )
@@ -555,7 +568,7 @@ pub async fn submit_for_review(pool: &PgPool, ctx: &AuthContext, item_id: Uuid) 
     let row = sqlx::query_as!(
         ItemRow,
         r#"update module_items set status = 'in_review', qa_report = $2, updated_at = now() where id = $1
-           returning id, module_id, parent_id, node_type, depth, title, content_type, quiz_config, status, qa_report, generated_by, subject_id"#,
+           returning id, module_id, parent_id, node_type, depth, title, content_type, quiz_config, status, qa_report, generated_by, subject_id, lesson_plan"#,
         item_id,
         qa_report_json,
     )
@@ -569,7 +582,7 @@ async fn update_status(pool: &PgPool, id: Uuid, status: &str) -> Result<ItemRow,
     let row = sqlx::query_as!(
         ItemRow,
         r#"update module_items set status = $2, updated_at = now() where id = $1
-           returning id, module_id, parent_id, node_type, depth, title, content_type, quiz_config, status, qa_report, generated_by, subject_id"#,
+           returning id, module_id, parent_id, node_type, depth, title, content_type, quiz_config, status, qa_report, generated_by, subject_id, lesson_plan"#,
         id,
         status,
     )
@@ -583,6 +596,17 @@ pub async fn publish(pool: &PgPool, ctx: &AuthContext, item_id: Uuid) -> Result<
     require_permission(ctx, Resource::ModuleItem, Action::Publish)?;
     let item = find_by_id(pool, item_id).await?.ok_or(AppError::NotFound("module_item_not_found"))?;
     publish_flow::validate_publish(&item.status)?;
+
+    // P39-002 — freeze a version of whatever's actually there. A plain
+    // legacy article (both fields null — its content lives only in
+    // content_blocks, migration 0044's own note) has nothing in the new
+    // shape worth freezing, so it's skipped rather than recording an
+    // empty version 1 that would never mean anything.
+    if item.lesson_plan.is_some() || item.quiz_config.is_some() {
+        let created_via = if item.generated_by == "ai" { "ai_generation" } else { "human" };
+        crate::services::module_item_version::freeze(pool, ctx, item_id, item.lesson_plan.as_ref(), item.quiz_config.as_ref(), created_via, None).await?;
+    }
+
     let row = update_status(pool, item_id, "published").await?;
     Ok(to_status_response(&row))
 }

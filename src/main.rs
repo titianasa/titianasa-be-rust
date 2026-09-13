@@ -15,6 +15,20 @@ async fn main() -> anyhow::Result<()> {
 
     db::run_migrations(&state.db).await?;
 
+    // P39-003 — a standing safety net so `learning_events` always has a
+    // partition for "now" and "next month" to insert into, even past
+    // whatever range the last migration pre-created. A proper monthly
+    // job belongs in Phase 40's job queue; this is what exists before
+    // that queue does.
+    titian_backend_rust::services::learning_event::ensure_current_partitions(&state.db).await?;
+    // P39-007 — drops any raw-event partition past its 24-month
+    // retention window. Same "boot-time safety net until Phase 40 has a
+    // real scheduler" reasoning as the line above.
+    let dropped_partitions = titian_backend_rust::services::learning_event::enforce_retention(&state.db).await?;
+    if !dropped_partitions.is_empty() {
+        tracing::info!(?dropped_partitions, "learning_events retention: dropped partitions past 24 months");
+    }
+
     let app = routes::create_router(state.clone());
 
     let listener = TcpListener::bind(&state.config.bind_addr).await?;

@@ -79,6 +79,8 @@ pub fn protected_routes() -> Router<Arc<AppState>> {
         .route("/quiz-proctor-sessions/{id}/unlock", post(handlers::item_rules::post_proctor_unlock))
         .route("/module-items/{id}/subject", patch(handlers::module::patch_item_subject))
         .route("/module-items/{id}/pending-reviews", get(handlers::module::get_pending_reviews))
+        .route("/module-items/{id}/versions", get(handlers::module::get_item_versions))
+        .route("/module-items/{id}/versions/{version}", get(handlers::module::get_item_version))
         .route("/module-items/{id}/duplicate", post(handlers::module::post_duplicate_item))
         .route("/module-items/{id}/submit-review", post(handlers::module::post_submit_review))
         .route("/module-items/{id}/publish", post(handlers::module::post_publish))

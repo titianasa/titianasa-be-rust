@@ -284,7 +284,11 @@ pub async fn submit_attempt(pool: &PgPool, config: &Config, ctx: &AuthContext, a
     let mut points_earned: f64 = 0.0;
     let mut touched_concepts: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     let mut concept_correctness: std::collections::HashMap<Uuid, Vec<f64>> = std::collections::HashMap::new();
-    let mut events: Vec<(String, serde_json::Value)> = Vec::new();
+    // P39-003 — event_type is always "question_answered" here today,
+    // but kept alongside entity_id/payload (rather than assumed) so a
+    // second event type could join this same loop later without
+    // reshaping it.
+    let mut events: Vec<(&'static str, Uuid, serde_json::Value)> = Vec::new();
     let mut question_snapshot = serde_json::Map::new();
 
     for q in &questions {
@@ -308,7 +312,7 @@ pub async fn submit_attempt(pool: &PgPool, config: &Config, ctx: &AuthContext, a
             }
         }
 
-        events.push(("question_answered".to_string(), serde_json::json!({"correct": correct, "difficulty": q.difficulty, "question_id": q.id, "concept_ids": concept_ids})));
+        events.push(("question_answered", q.id, serde_json::json!({"correct": correct, "difficulty": q.difficulty, "question_id": q.id, "concept_ids": concept_ids})));
         question_snapshot.insert(q.id.to_string(), serde_json::json!({"data": q.data, "correct_answer": q.correct_answer, "explanation": q.explanation, "version": q.version}));
     }
 
@@ -325,16 +329,20 @@ pub async fn submit_attempt(pool: &PgPool, config: &Config, ctx: &AuthContext, a
     .execute(pool)
     .await?;
 
+    // P39-003 — routed through the registry (learning_event::record)
+    // instead of a raw insert, so an unrecognised event type or a
+    // payload missing what mastery.rs/frss.rs actually read would be
+    // caught here rather than silently stored. The payload shape below
+    // is UNCHANGED from before this migration — see learning_event.rs's
+    // own header for exactly which keys those readers depend on.
     let mut learning_events_created = 0i64;
-    for (event_type, payload) in &events {
-        sqlx::query!(
-            r#"insert into learning_events (user_id, event_type, entity_type, entity_id, payload) values ($1, $2, 'question', $3, $4)"#,
+    for (event_type, question_id, payload) in &events {
+        crate::services::learning_event::record(
+            pool,
             ctx.user_id,
-            event_type,
-            payload.get("question_id").and_then(|v| v.as_str()).and_then(|s| Uuid::parse_str(s).ok()).unwrap(),
-            payload,
+            crate::services::learning_event::EventChannel::Server,
+            crate::services::learning_event::NewLearningEvent::server(event_type, "question", *question_id, payload.clone(), "practice"),
         )
-        .execute(pool)
         .await?;
         learning_events_created += 1;
     }

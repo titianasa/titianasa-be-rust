@@ -21,12 +21,16 @@ mod ai_retry_test;
 mod attempt_submission_test;
 mod attendance_test;
 mod auth_test;
+mod client_events_test;
 mod drive_test;
 mod economy_test;
 mod gamification_test;
+mod learning_event_test;
 mod learning_test;
+mod live_chat_test;
 mod marketplace_test;
 mod messaging_test;
+mod module_item_versions_test;
 mod organization_test;
 mod proctoring_test;
 mod question_test;
@@ -34,9 +38,11 @@ mod quiz_batch_generation_test;
 mod quiz_convert_group_type_test;
 mod quiz_draft_gate_test;
 mod quiz_generation_concurrency_test;
+mod quiz_learning_events_test;
 mod quiz_max_attempts_test;
 mod quiz_parse_raw_test;
 mod quiz_suggest_group_types_test;
+mod user_data_consent_test;
 
 /// The guard for the comment above: a `*_test.rs` dropped into this
 /// directory without a matching `mod` line compiles fine and runs zero

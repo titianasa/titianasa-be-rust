@@ -131,11 +131,17 @@ pub async fn submit_quiz_attempt(
     // through its preflight.
     let proctor_session = crate::services::item_proctor::session_for_submit(pool, ctx.user_id, item_id).await?;
 
-    let raw_config = sqlx::query_scalar!(r#"select quiz_config from module_items where id = $1"#, item_id)
+    // P39-002 — `current_version` is read in the SAME query as the
+    // `quiz_config` being scored, so the version recorded on this
+    // attempt is unambiguously the one that was actually live at grading
+    // time, not whatever a second, later query might see if the item
+    // gets published again in between.
+    let item_row = sqlx::query!(r#"select quiz_config, current_version from module_items where id = $1"#, item_id)
         .fetch_optional(pool)
         .await?
-        .flatten()
-        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("quiz item {} has no quiz_config", item_id)))?;
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("quiz item {} not found", item_id)))?;
+    let raw_config = item_row.quiz_config.ok_or_else(|| AppError::Internal(anyhow::anyhow!("quiz item {} has no quiz_config", item_id)))?;
+    let content_version = item_row.current_version;
     let quiz: QuizConfig = quiz_config_schema::parse(&raw_config)?;
 
     let mut points_possible = 0.0f64;
@@ -199,19 +205,63 @@ pub async fn submit_quiz_attempt(
     let status = if has_pending { "submitted" } else { "evaluated" };
 
     sqlx::query!(
-        r#"update attempts set answers = $2, score = $3, status = $4, submitted_at = now(), question_snapshot = $5 where id = $1"#,
+        r#"update attempts set answers = $2, score = $3, status = $4, submitted_at = now(), question_snapshot = $5, content_version = $6 where id = $1"#,
         attempt_id,
         serde_json::Value::Object(answers_snapshot),
         score,
         status,
         raw_config,
+        content_version,
     )
     .execute(pool)
     .await?;
 
+    // P39-004 (ADR-0013 L1) — a proctored/exam-monitored sitting is a
+    // "tryout" in ADR-0013 §1.5's sense; everything else here is casual
+    // "practice". Read before `close_session` below (Uuid is Copy, so
+    // this doesn't move anything out from under it).
+    let source: &'static str = if proctor_session.is_some() { "tryout" } else { "practice" };
+
+    // One `question_answered` per question, carrying the P39-001 `uid`
+    // (not the old bank's `questions.id` — these questions live in
+    // `quiz_config`, not that table) as `entity_id` AND `content_uid`.
+    // Absent uid (shouldn't happen post-backfill, but content predating
+    // it could in principle slip through some other write path) skips
+    // the event rather than inventing a fake identity for it.
+    for group in &quiz.question_groups {
+        for question in &group.questions {
+            let Some(uid) = question.uid else { continue };
+            let key = question.key();
+            let submitted = answers.get(&key).cloned().unwrap_or(serde_json::Value::Null);
+            let correct = results.iter().find(|r| r.question_number == key).and_then(|r| r.correct);
+            let mut event = crate::services::learning_event::NewLearningEvent::server(
+                "question_answered",
+                "question",
+                uid,
+                serde_json::json!({"correct": correct, "difficulty": question.taxonomy.as_ref().and_then(|t| t.difficulty), "answer": submitted}),
+                source,
+            );
+            event.module_item_id = Some(item_id);
+            event.content_uid = Some(uid.to_string());
+            event.content_version = content_version;
+            crate::services::learning_event::record(pool, ctx.user_id, crate::services::learning_event::EventChannel::Server, event).await?;
+        }
+    }
+
+    let mut submitted_event = crate::services::learning_event::NewLearningEvent::server(
+        "quiz_attempt_submitted",
+        "quiz_attempt",
+        attempt_id,
+        serde_json::json!({"score": score, "pending_review": has_pending, "status": status}),
+        source,
+    );
+    submitted_event.module_item_id = Some(item_id);
+    submitted_event.content_version = content_version;
+    crate::services::learning_event::record(pool, ctx.user_id, crate::services::learning_event::EventChannel::Server, submitted_event).await?;
+
     // What the access gates read. A score still waiting on a teacher is
     // recorded once graded (grade_manual_group).
-    crate::services::item_progress::record_completion(pool, ctx.user_id, item_id, if has_pending { None } else { score }).await?;
+    crate::services::item_progress::record_completion(pool, ctx.user_id, item_id, if has_pending { None } else { score }, source).await?;
     if let Some(session_id) = proctor_session {
         crate::services::item_proctor::close_session(pool, session_id, attempt_id).await?;
     }
@@ -382,6 +432,40 @@ pub async fn grade_manual_group(pool: &PgPool, ctx: &AuthContext, attempt_id: Uu
         evaluation::insert_many_feedback(pool, inserted.id, &[evaluation::FeedbackItemInput { content: comment, position: None }]).await?;
     }
 
+    // P39-004 — a proctored sitting (`close_session` stamps `attempt_id`
+    // onto its `quiz_proctor_sessions` row at submit time) is still
+    // "tryout" for everything that happens afterward on this same
+    // attempt, grading included.
+    let source: &'static str = if sqlx::query_scalar!(r#"select exists(select 1 from quiz_proctor_sessions where attempt_id = $1) as "exists!""#, attempt_id).fetch_one(pool).await? {
+        "tryout"
+    } else {
+        "practice"
+    };
+
+    // The specific question's `uid` — read out of the frozen snapshot,
+    // which is the same authoritative record `list_pending_reviews`
+    // already searches for exactly this group/number key.
+    if let Some(uid) = attempt
+        .question_snapshot
+        .as_ref()
+        .and_then(|s| s.get("question_groups"))
+        .and_then(|g| g.as_array())
+        .and_then(|groups| groups.iter().find(|g| g.get("group_id").and_then(|v| v.as_str()) == Some(group_id)))
+        .and_then(|g| g.get("questions"))
+        .and_then(|q| q.as_array())
+        .and_then(|questions| questions.iter().find(|q| q.get("number").map(value_to_key).as_deref() == Some(question_number)))
+        .and_then(|q| q.get("uid"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+    {
+        let mut event = crate::services::learning_event::NewLearningEvent::server("question_graded", "question", uid, serde_json::json!({"score": score}), source);
+        event.content_uid = Some(uid.to_string());
+        if let Some(item_id) = attempt.item_id {
+            event.module_item_id = Some(item_id);
+        }
+        crate::services::learning_event::record(pool, attempt.user_id, crate::services::learning_event::EventChannel::Server, event).await?;
+    }
+
     // Re-check whether every Manual group on this attempt now has a
     // 'human' evaluation — if so, fold this score into the aggregate
     // and flip the attempt to 'evaluated'.
@@ -438,7 +522,7 @@ pub async fn grade_manual_group(pool: &PgPool, ctx: &AuthContext, attempt_id: Uu
     sqlx::query!(r#"update attempts set status = 'evaluated', score = $2 where id = $1"#, attempt_id, combined).execute(pool).await?;
     // Now that the score is final, a "lulus dengan skor X%" gate can use it.
     if let Some(item_id) = attempt.item_id {
-        crate::services::item_progress::record_completion(pool, attempt.user_id, item_id, Some(combined)).await?;
+        crate::services::item_progress::record_completion(pool, attempt.user_id, item_id, Some(combined), source).await?;
     }
     Ok(())
 }

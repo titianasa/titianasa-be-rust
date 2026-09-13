@@ -32,6 +32,10 @@ const PROMPT_ID: &str = "live_chat_turn_v1";
 /// needs enough context to remember what was already covered.
 const MAX_HISTORY_TURNS: usize = 20;
 const MAX_MESSAGE_CHARS: usize = 4000;
+/// P39-006 — the question TEXT stored in `learning_events` is capped
+/// shorter than the model actually receives (`MAX_MESSAGE_CHARS`); this
+/// is a record for later review/analytics, not the AI's own context.
+const MAX_STORED_QUESTION_CHARS: usize = 500;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatHistoryEntry {
@@ -124,6 +128,29 @@ pub fn user_prompt(message: &str, history: &[ChatHistoryEntry]) -> String {
     format!("Riwayat percakapan sejauh ini:\n{context}\n\nPesan terbaru siswa:\n\"{message}\"\n\nBalas sebagai Tutor AI, ikuti aturan di atas.")
 }
 
+/// P39-006 — one `live_chat_question` event per student turn, whether
+/// or not the tutor's reply ever arrives (a provider failure shouldn't
+/// erase that the student DID ask something). Gated on `ai_chat_storage`
+/// consent inside `learning_event::record` itself — this function never
+/// branches on consent, it just calls through and ignores the `None`
+/// (chat still works without it, per ADR-0013 §1.4).
+async fn record_question_event(pool: &PgPool, user_id: Uuid, item_id: Uuid, plan: &LessonPlan, section_index: usize, message: &str) {
+    let current_version: Option<i32> = sqlx::query_scalar!(r#"select current_version from module_items where id = $1"#, item_id).fetch_optional(pool).await.ok().flatten().flatten();
+    let mut event = crate::services::learning_event::NewLearningEvent::server(
+        "live_chat_question",
+        "module_item",
+        item_id,
+        serde_json::json!({"question": excerpt(message, MAX_STORED_QUESTION_CHARS)}),
+        "live_ai_chat",
+    );
+    event.module_item_id = Some(item_id);
+    event.content_uid = Some(plan.sections[section_index].id.clone());
+    event.content_version = current_version;
+    if let Err(e) = crate::services::learning_event::record(pool, user_id, crate::services::learning_event::EventChannel::Server, event).await {
+        tracing::warn!(error = ?e, %item_id, "failed to record live_chat_question event");
+    }
+}
+
 pub async fn generate_turn(pool: &PgPool, ai: &dyn AIProvider, model: &str, ctx: &AuthContext, req: ChatTurnRequest) -> Result<ChatTurnResponse, AppError> {
     // Same read gate as opening the item — a locked or unpublished
     // Modul Belajar has nothing here either.
@@ -146,6 +173,8 @@ pub async fn generate_turn(pool: &PgPool, ai: &dyn AIProvider, model: &str, ctx:
         return Err(validation_error("empty_plan", "modul ini belum punya bagian untuk didiskusikan"));
     }
     let section_index = req.section_index.min(plan.sections.len() - 1);
+
+    record_question_event(pool, ctx.user_id, req.item_id, &plan, section_index, message).await;
 
     let ai_task_id = Uuid::new_v4();
     let max_tokens = resolve_max_tokens(model, 900).await;
@@ -224,6 +253,8 @@ pub async fn generate_turn_stream(
         return Err(validation_error("empty_plan", "modul ini belum punya bagian untuk didiskusikan"));
     }
     let section_index = req.section_index.min(plan.sections.len() - 1);
+
+    record_question_event(&pool, ctx.user_id, req.item_id, &plan, section_index, &message).await;
 
     let ai_task_id = Uuid::new_v4();
     let max_tokens = resolve_max_tokens(&model, 900).await;

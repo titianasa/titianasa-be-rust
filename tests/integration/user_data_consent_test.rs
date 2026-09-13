@@ -1,10 +1,6 @@
-// Phase 38 (Fase 5b) — "Tempel & Parse": pasting text the author already
-// has (a PDF's copied text, an old worksheet) should extract those
-// questions rather than invent new ones, the same idea generate-quiz-group
-// already offers for an attached image, just for `raw_text` instead of
-// `asset_id`. Proven over real HTTP so the wiring (request -> blueprint ->
-// build_prompt) is covered end to end, not just the prompt-string unit
-// tests in quiz_generation.rs.
+// P39-007 (ADR-0013 "Privasi") — the HTTP surface (`GET`/`POST
+// /me/consents`) over `user_data_consent.rs`, which `learning_event_test.rs`
+// already covers at the service level.
 
 use axum::{
     body::Body,
@@ -73,23 +69,6 @@ fn test_config() -> Config {
     }
 }
 
-const VALID_MC_REPLY: &str = r#"{
-  "questions": [
-    {
-      "number": 1,
-      "stem": "Apa ibu kota Perancis?",
-      "choices": [
-        {"label": "A", "text": "Lyon"},
-        {"label": "B", "text": "Paris"},
-        {"label": "C", "text": "Marseille"},
-        {"label": "D", "text": "Nice"}
-      ],
-      "answer": "B",
-      "explanation": "Paris adalah ibu kota Perancis."
-    }
-  ]
-}"#;
-
 fn build_app(pool: PgPool) -> axum::Router {
     let state = Arc::new(AppState {
         db: pool,
@@ -97,8 +76,8 @@ fn build_app(pool: PgPool) -> axum::Router {
         config: test_config(),
         google_verifier: titian_backend_rust::services::google_oauth::GoogleTokenVerifier::new(),
         payment_provider: Arc::new(titian_backend_rust::services::payment_provider::StubQrisProvider),
-        ai_provider: Arc::new(FakeAIProvider::success(VALID_MC_REPLY)),
-        text_ai_provider: Arc::new(FakeAIProvider::success(VALID_MC_REPLY)),
+        ai_provider: Arc::new(FakeAIProvider::success("{}")),
+        text_ai_provider: Arc::new(FakeAIProvider::success("{}")),
         meeting_provider: Arc::new(titian_backend_rust::services::meeting_provider::StubMeetingProvider),
         storage: Arc::new(titian_backend_rust::services::storage::InMemoryStorage::new()),
         canvas_hub: Arc::new(titian_backend_rust::services::canvas_hub::CanvasHub::new()),
@@ -144,43 +123,38 @@ async fn send(app: axum::Router, method: Method, uri: &str, token: &str, body: V
 }
 
 #[sqlx::test]
-async fn pasted_text_extracts_into_an_empty_group(pool: PgPool) {
-    let (_dev_uid, dev_token) = insert_user_with_role(&pool, "parseraw-dev@example.com", "curriculum_developer").await;
-    let app = build_app(pool.clone());
+async fn get_consents_defaults_both_kinds_to_not_granted(pool: PgPool) {
+    let (_uid, token) = insert_user_with_role(&pool, "consenthttp1@example.com", "student").await;
+    let app = build_app(pool);
 
-    let subject_id: Uuid = sqlx::query_scalar!(r#"insert into subjects (code, name) values ($1, $1) returning id"#, "SUBJ-PARSERAW").fetch_one(&pool).await.unwrap();
-    let (_, module) = send(app.clone(), Method::POST, "/modules", &dev_token, json!({"is_folder": false, "subject_id": subject_id, "code": "MOD-PARSERAW", "title": "Module"})).await;
-    let module_id = module["id"].as_str().unwrap().to_string();
-    let (_, item) = send(app.clone(), Method::POST, &format!("/modules/{module_id}/items"), &dev_token, json!({"node_type": "item", "title": "Quiz", "content_type": "quiz"})).await;
-    let item_id = item["id"].as_str().unwrap().to_string();
-    let (status, patched) = send(
-        app.clone(),
-        Method::PATCH,
-        &format!("/module-items/{item_id}/quiz-config"),
-        &dev_token,
-        json!({"quiz_config": {"sections": [{"section_id": "s1", "title": "Bagian 1"}], "question_groups": [{"group_id": "g0", "type": "multiple_choice", "section_id": "s1", "questions": []}]}}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{patched:?}");
-
-    let (status, body) = send(
-        app.clone(),
-        Method::POST,
-        "/ai/generate-quiz-group",
-        &dev_token,
-        json!({
-            "item_id": item_id,
-            "group_id": "g0",
-            "mode": "replace",
-            "raw_text": "1. Apa ibu kota Perancis?\nA. Lyon\nB. Paris\nC. Marseille\nD. Nice\nJawaban: B",
-        }),
-    )
-    .await;
+    let (status, body) = send(app, Method::GET, "/me/consents", &token, json!({})).await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
-    assert_eq!(body["question_count"], 1);
+    let list = body.as_array().unwrap();
+    assert_eq!(list.len(), 2, "both known kinds, even with no row yet");
+    assert!(list.iter().all(|c| c["granted"] == json!(false)));
+}
 
-    let (_, item) = send(app, Method::GET, &format!("/module-items/{item_id}"), &dev_token, json!({})).await;
-    let g0 = item["quiz_config"]["question_groups"][0].clone();
-    assert_eq!(g0["questions"][0]["stem"], "Apa ibu kota Perancis?");
-    assert_eq!(g0["questions"][0]["answer"], "B");
+#[sqlx::test]
+async fn posting_a_consent_grant_is_reflected_on_the_next_get(pool: PgPool) {
+    let (_uid, token) = insert_user_with_role(&pool, "consenthttp2@example.com", "student").await;
+    let app = build_app(pool);
+
+    let (status, granted) = send(app.clone(), Method::POST, "/me/consents", &token, json!({"kind": "learning_analytics", "granted": true})).await;
+    assert_eq!(status, StatusCode::OK, "{granted:?}");
+    assert_eq!(granted["granted"], json!(true));
+
+    let (status, list) = send(app, Method::GET, "/me/consents", &token, json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let entry = list.as_array().unwrap().iter().find(|c| c["kind"] == json!("learning_analytics")).unwrap();
+    assert_eq!(entry["granted"], json!(true));
+}
+
+#[sqlx::test]
+async fn posting_an_unknown_kind_is_rejected(pool: PgPool) {
+    let (_uid, token) = insert_user_with_role(&pool, "consenthttp3@example.com", "student").await;
+    let app = build_app(pool);
+
+    let (status, body) = send(app, Method::POST, "/me/consents", &token, json!({"kind": "not_a_real_kind", "granted": true})).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert_eq!(body["error"], json!("unknown_consent_kind"));
 }

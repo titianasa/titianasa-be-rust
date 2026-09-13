@@ -42,3 +42,5 @@ pub mod question;
 pub mod speaking_room;
 pub mod tutor;
 pub mod tutor_review;
+pub mod user_data_consent;
+pub mod client_events;
