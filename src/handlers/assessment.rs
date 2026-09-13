@@ -104,7 +104,7 @@ pub async fn post_submit(
             });
 
         let quiz_answers = body.quiz_answers.unwrap_or_default();
-        let result = quiz_attempt::submit_quiz_attempt(&state.db, &state.config, state.ai_provider.as_ref(), state.storage.as_ref(), &ctx, attempt_id, &quiz_answers).await?;
+        let result = quiz_attempt::submit_quiz_attempt(&state.db, &state.config, state.ai_provider.as_ref(), state.text_ai_provider.as_ref(), state.storage.as_ref(), &ctx, attempt_id, &quiz_answers).await?;
 
         let xp_amount = skill_category.and_then(xp::skill_xp).unwrap_or(20);
         xp::award_xp(&state.db, ctx.user_id, xp_amount, "quiz_completed", Some(&format!("attempt:{attempt_id}")), skill_category).await?;

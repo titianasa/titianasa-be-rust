@@ -15,6 +15,7 @@
 // generator that overwrote the author's passage or option pool every
 // time would make "generate a few more questions" impossible.
 
+use futures_util::stream::{self, StreamExt};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -26,6 +27,12 @@ use crate::services::permissions::{require_permission, Action, Resource};
 use crate::services::quiz_config::{value_to_key, QuizConfig, QuizQuestionGroup};
 use crate::services::storage::AssetStorage;
 use crate::services::{ai_task, quiz_config_schema, quiz_shape, quiz_subtype};
+
+/// How many groups' generation calls (each a real network round trip to
+/// the model) run at once. Capped rather than unbounded so a 20-group
+/// paper doesn't open 20 simultaneous provider connections — and DB
+/// writes stay safe either way, each one taking its own row lock.
+const BATCH_CONCURRENCY: usize = 3;
 
 const PROVIDER: &str = "openrouter";
 const PROMPT_ID: &str = "quiz_group_generation_v1";
@@ -85,6 +92,20 @@ pub struct QuizGenerationBlueprint {
     /// An image or scanned page to extract questions FROM, instead of
     /// inventing them. Must be an asset the caller can read.
     pub asset_id: Option<Uuid>,
+    /// "Tempel & Parse" — pasted text to extract questions FROM (a PDF's
+    /// copied text, an old worksheet), instead of inventing new ones.
+    /// Same idea as `asset_id` but for text the author already has
+    /// rather than a photographed page. Ignored when `asset_id` is set.
+    pub raw_text: Option<String>,
+    /// "Ubah tipe soal" — reshape this group into a DIFFERENT subtype
+    /// instead of regenerating in its current one. When set, the prompt
+    /// is built from the NEW subtype's shape (not the group's stored
+    /// one), and the merge writes the new subtype id onto the group
+    /// alongside its regenerated questions.
+    pub convert_to_subtype: Option<String>,
+    /// Fase 5d — stamp `ai_meta.draft = true` on the written group. See
+    /// `GenerateQuizGroupRequest::mark_draft`.
+    pub mark_draft: bool,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -150,8 +171,15 @@ pub fn build_prompt(
     start_number: i64,
     from_image: bool,
     reference_block: &str,
+    source_text: Option<&str>,
 ) -> (String, String) {
     let spec = quiz_shape::spec(info.shape);
+    // A caller-requested count that would contradict a shape's own
+    // fixed-count rule (HighlightWords: exactly one question, scored as
+    // a set over the whole transcript) is silently corrected rather than
+    // handed to the model as-is — asking for both at once produced zero
+    // questions, not either number.
+    let count = quiz_shape::fixed_question_count(info.shape).unwrap_or(count);
 
     let mut rules: Vec<String> = spec.rules.iter().map(|r| (*r).to_string()).collect();
     if let Some(hint) = quiz_shape::subtype_hint(info.id) {
@@ -174,14 +202,17 @@ MUTU SOAL — ini yang membedakan soal ujian sungguhan dari soal asal jadi:\n\
 - Setiap soal WAJIB punya `explanation` yang menjelaskan MENGAPA kunci benar, dan — bila ada pilihan — mengapa pengecoh yang paling menggoda itu salah. Tulis sebagai pembahasan untuk siswa, bukan catatan untuk penulis soal.\n\
 - Pengecoh harus mencerminkan kesalahan berpikir yang benar-benar sering terjadi (salah rumus, salah baca data, kesimpulan terlalu jauh), bukan pilihan yang jelas ngawur.\n\
 - Jangan membuat soal yang bisa dijawab benar tanpa membaca stimulus.\n\
-- Jangan mengulang soal yang sudah ada; variasikan tingkat kesulitan.\n\
+- Jangan mengulang soal yang sudah ada.\n\
+{taxonomy_rules}\n\
 - Untuk rumus, notasi matematika, atau simbol kimia, tulis dengan LaTeX di antara $...$.\n\
+- JANGAN menggambar diagram (garis bilangan, grafik, bangun datar) dengan LaTeX, termasuk deretan \\text{{---}} atau | di dalam $...$. Huruf LaTeX tidak berjarak sama, sehingga angka tidak jatuh tepat di bawah garisnya dan gambar itu menyesatkan siswa. Nyatakan posisi dengan kata-kata atau tabel. Bila gambar teks sederhana memang perlu, tulis di dalam blok kode ``` pada `stem` (tidak pernah di pilihan jawaban), dengan setiap label tepat di bawah garis tegaknya.\n\
 - PENTING: di dalam JSON, setiap garis miring terbalik LaTeX WAJIB ditulis ganda. Tulis \\\\times, \\\\frac, \\\\text — BUKAN \\times, karena JSON akan membacanya sebagai karakter kendali dan rumusnya rusak.\n\
 - Nomor soal WAJIB berurutan mulai dari {start_number}.",
         label = info.label,
         description = spec.description,
         schema = spec.schema,
         rules = rules.iter().map(|r| format!("- {r}")).collect::<Vec<_>>().join("\n"),
+        taxonomy_rules = crate::services::quiz_taxonomy::prompt_rules(config.level.as_deref().unwrap_or(""), count),
     );
 
     // Supplying a key for someone else's question is a different job
@@ -219,13 +250,28 @@ MUTU SOAL — ini yang membedakan soal ujian sungguhan dari soal asal jadi:\n\
         user.push_str(
             "EKSTRAK soal dari gambar/dokumen terlampir — JANGAN mengarang soal baru. Salin pertanyaan, pilihan, dan (bila terlihat) kunci jawabannya apa adanya, lalu susun ke bentuk JSON di atas. Bila kunci jawaban tidak terlihat di sumber, tentukan sendiri jawaban yang benar dan katakan dasarnya di `explanation`.\n\n",
         );
+    } else if let Some(text) = source_text.filter(|s| !s.trim().is_empty()) {
+        // "Tempel & Parse" — the author pasted soal they already have
+        // (from a PDF, an old worksheet) instead of asking for new ones.
+        user.push_str(&format!(
+            "EKSTRAK soal dari TEKS di bawah — JANGAN mengarang soal baru. Salin pertanyaan, pilihan, dan (bila terlihat) kunci jawabannya apa adanya, lalu susun ke bentuk JSON di atas. Bila kunci jawaban tidak terlihat di sumber, tentukan sendiri jawaban yang benar dan katakan dasarnya di `explanation`.\n\nTEKS SUMBER:\n{text}\n\n"
+        ));
     }
     match mode {
         GenerationMode::Rewrite => {
             let question_json = target.map(|t| serde_json::to_string_pretty(t).unwrap_or_default()).unwrap_or_default();
-            user.push_str(&format!(
-                "Tulis ULANG satu soal berikut agar lebih baik — pertahankan topik dan tingkat kesulitannya, perbaiki kejelasan, kualitas pengecoh, dan pembahasannya. Keluarkan tepat 1 soal.\n\nSOAL LAMA:\n{question_json}\n\n"
-            ));
+            let has_instruction = context_prompt.is_some_and(|c| !c.trim().is_empty());
+            let directive = if has_instruction {
+                // A free-text instruction ("jadikan lebih sulit", "ganti
+                // konteks ke olahraga") may deliberately ask to CHANGE the
+                // difficulty or topic — telling the model to "keep them
+                // the same" in the same breath would just fight the
+                // instruction it's about to read below.
+                "Tulis ULANG satu soal berikut mengikuti instruksi tambahan di bawah — termasuk bila instruksi itu meminta mengubah tingkat kesulitan, topik, atau konteksnya. Keluarkan tepat 1 soal."
+            } else {
+                "Tulis ULANG satu soal berikut agar lebih baik — pertahankan topik dan tingkat kesulitannya, perbaiki kejelasan, kualitas pengecoh, dan pembahasannya. Keluarkan tepat 1 soal."
+            };
+            user.push_str(&format!("{directive}\n\nSOAL LAMA:\n{question_json}\n\n"));
         }
         GenerationMode::Append => {
             user.push_str(&format!("Tambahkan {count} soal BARU ke grup ini.\n"));
@@ -481,6 +527,99 @@ async fn record_failed(pool: &PgPool, ai_task_id: Uuid, user_id: Uuid, model: &s
     }
 }
 
+// --- Not repeating what the rest of the topic already asks ---
+//
+// A topic's bab each get their own Latihan, generated one at a time,
+// and each call used to see only its OWN group's questions. The pilot
+// showed the cost: "titik acuan pada garis bilangan disebut ..." was
+// asked, near-verbatim, as the C1 recall question of three different
+// bab — every bab's module mentions zero as the reference point, and a
+// C1 slot pulls the model toward the most quotable fact on the page.
+// A bank built that way fills with duplicates a learner meets again and
+// again. So a new question now sees every question already written in
+// its topic: other groups in this quiz, and every other quiz item in
+// the same module.
+
+/// How many sibling questions go into the prompt. A topic in the
+/// library has ~7 bab x 5 questions; this leaves room for larger decks
+/// without letting one prompt balloon.
+const SIBLING_QUESTION_LIMIT: usize = 80;
+/// Enough of a stem to recognise what it tests, not the whole stimulus.
+const SIBLING_STEM_CHARS: usize = 140;
+
+/// One question written elsewhere in the topic: which quiz it is in, and
+/// the start of its stem.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SiblingQuestion {
+    pub source: String,
+    pub stem: String,
+}
+
+fn clip_stem(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= SIBLING_STEM_CHARS {
+        flat
+    } else {
+        format!("{}…", flat.chars().take(SIBLING_STEM_CHARS).collect::<String>())
+    }
+}
+
+fn stems_of(source: &str, groups: &[QuizQuestionGroup]) -> Vec<SiblingQuestion> {
+    groups
+        .iter()
+        .flat_map(|g| g.questions.iter())
+        .filter_map(|q| q.prompt_text().filter(|t| !t.trim().is_empty()))
+        .map(|t| SiblingQuestion { source: source.to_string(), stem: clip_stem(t) })
+        .collect()
+}
+
+/// Every question in the topic outside the group being generated: the
+/// quiz's other groups first (closest to this one), then the module's
+/// other quiz items in their tree order.
+async fn sibling_questions(pool: &PgPool, item_id: Uuid, quiz: &QuizConfig, group_id: &str) -> Result<Vec<SiblingQuestion>, AppError> {
+    let other_groups: Vec<QuizQuestionGroup> = quiz.question_groups.iter().filter(|g| g.group_id != group_id).cloned().collect();
+    let mut out = stems_of("grup lain di kuis ini", &other_groups);
+
+    let rows = sqlx::query!(
+        r#"select title, quiz_config as "quiz_config!"
+           from module_items
+           where module_id = (select module_id from module_items where id = $1)
+             and id <> $1 and content_type = 'quiz' and quiz_config is not null
+           order by order_index asc, created_at asc"#,
+        item_id,
+    )
+    .fetch_all(pool)
+    .await?;
+    for row in rows {
+        // A sibling this build cannot parse is skipped, not fatal: an
+        // unrelated broken quiz must not block generating this one.
+        if let Ok(sibling) = quiz_config_schema::parse(&row.quiz_config) {
+            out.extend(stems_of(&row.title, &sibling.question_groups));
+        }
+    }
+    out.truncate(SIBLING_QUESTION_LIMIT);
+    Ok(out)
+}
+
+/// The prompt section listing them. Framed as "don't test the same
+/// thing the same way", not "don't copy this text": a later bab may
+/// legitimately build on a concept an earlier one introduced, and a
+/// reworded copy of the same recall question is exactly as redundant as
+/// a verbatim one.
+pub fn sibling_questions_block(siblings: &[SiblingQuestion]) -> String {
+    if siblings.is_empty() {
+        return String::new();
+    }
+    let mut block = String::from(
+        "\nSOAL YANG SUDAH ADA DI TOPIK INI (di kuis bab lain). JANGAN menguji fakta, istilah, atau kemampuan yang sama dengan cara yang sama, termasuk bila kalimatnya diubah. \
+Bila butuh soal C1/C2, pilih fakta yang KHAS bab ini, bukan fakta umum yang juga dibahas bab lain. Konsep bab lain boleh dipakai sebagai bekal, asalkan yang diuji adalah hal baru dari bab ini:\n",
+    );
+    for s in siblings {
+        block.push_str(&format!("- [{}] {}\n", s.source, s.stem));
+    }
+    block
+}
+
 // POST /ai/generate-quiz-group
 pub async fn generate_quiz_group(
     pool: &PgPool,
@@ -509,8 +648,9 @@ pub async fn generate_quiz_group(
         .ok_or(AppError::NotFound("quiz_config_not_found"))?;
     let quiz: QuizConfig = quiz_config_schema::parse(&raw_config)?;
     let group = find_group(&quiz, &bp.group_id).ok_or(AppError::NotFound("question_group_not_found"))?;
-    let info = quiz_subtype::find(&group.r#type).ok_or_else(|| {
-        AppError::UnprocessableEntity("unknown_subtype", format!("subtype \"{}\" tidak dikenal", group.r#type))
+    let target_subtype = bp.convert_to_subtype.as_deref().unwrap_or(&group.r#type);
+    let info = quiz_subtype::find(target_subtype).ok_or_else(|| {
+        AppError::UnprocessableEntity("unknown_subtype", format!("subtype \"{target_subtype}\" tidak dikenal"))
     })?;
 
     // A group whose questions a human writes by hand (an H5P embed, a
@@ -577,7 +717,7 @@ pub async fn generate_quiz_group(
     };
     let reference_block = crate::services::lesson_plan_ai::referenced_items_block(pool, bp.item_id, &reference_ids).await?;
 
-    let (system_prompt, user_prompt) = build_prompt(
+    let (system_prompt, mut user_prompt) = build_prompt(
         &quiz,
         group,
         info,
@@ -588,11 +728,29 @@ pub async fn generate_quiz_group(
         start_number,
         image_url.is_some(),
         &reference_block,
+        bp.raw_text.as_deref(),
     );
+    // Only when the model is WRITING questions. Extraction (an image, a
+    // pasted worksheet) copies what the source says, and answer_only
+    // touches no stem — telling either to avoid the topic's other
+    // questions would fight the job they were given.
+    let extracting = image_url.is_some() || bp.raw_text.as_deref().is_some_and(|t| !t.trim().is_empty());
+    if !extracting && bp.mode != GenerationMode::AnswerOnly {
+        let siblings = sibling_questions(pool, bp.item_id, &quiz, &bp.group_id).await?;
+        user_prompt.push_str(&sibling_questions_block(&siblings));
+    }
 
     let ai_task_id = Uuid::new_v4();
     let requested = if bp.mode.targets_one_question() { 1 } else { bp.count };
-    let max_tokens = resolve_max_tokens(model, (500 * requested).max(1500)).await;
+    // 500/question (1500 floor) was too tight in practice — a group that
+    // also emits a passage/table/option-pool alongside its questions,
+    // in Indonesian, regularly ran past it and got cut off mid-string
+    // (surfaced as "Model tidak mengembalikan JSON yang valid"), not
+    // because the model failed but because it was truncated. 900/
+    // question plus a flat 2000 for that shared context covers real
+    // observed output sizes with real headroom to spare; capped well
+    // under what gemini-3.8-flash actually supports.
+    let max_tokens = resolve_max_tokens(model, ((900 * requested) + 2000).clamp(3000, 32_000)).await;
     let request = GenerationRequest {
         model: model.to_string(),
         system_prompt,
@@ -607,13 +765,18 @@ pub async fn generate_quiz_group(
     // One retry, on either a transient provider failure or output that
     // didn't come back as valid JSON — both are exactly the kind of
     // one-off flakiness a second attempt tends to clear, and neither
-    // needed the merge below to happen first to detect.
+    // needed the merge below to happen first to detect. Never falls back
+    // to a different provider — same model, same provider, one more try
+    // — and the LAST failure's real reason is kept so a caller sees
+    // something more useful than a bare error code if both attempts fail.
     let mut outcome = None;
+    let mut last_error = String::new();
     for attempt in 0..2 {
         let generation = match ai.generate(request.clone()).await {
             Ok(g) => g,
             Err(e) => {
                 tracing::warn!(error = ?e, %ai_task_id, attempt, "quiz group generation provider call failed");
+                last_error = format!("Provider gagal: {e}");
                 continue;
             }
         };
@@ -623,32 +786,59 @@ pub async fn generate_quiz_group(
                 outcome = Some((parsed, generation));
                 break;
             }
-            Err(_) => {
+            Err(e) => {
                 tracing::warn!(%ai_task_id, attempt, raw_output = %generation.text, "quiz generation output was not valid JSON");
+                last_error = format!("Model tidak mengembalikan JSON yang valid: {e}");
             }
         }
     }
     let Some((parsed, generation)) = outcome else {
         tracing::warn!(%ai_task_id, "quiz group generation failed after retry");
         record_failed(pool, ai_task_id, ctx.user_id, model).await;
-        return Err(AppError::AiOutputValidationFailed);
+        return Err(AppError::AiOutputValidationFailed(Some(last_error)));
     };
 
-    // Merge into the RAW json so fields this Rust struct does not model
-    // (a future layout's) survive untouched.
-    let mut next_config = raw_config.clone();
+    // The merge reads and writes against the FRESHEST row, inside a lock,
+    // rather than the `raw_config` read at the top of this function —
+    // batch generation runs several groups of the same item concurrently,
+    // and a plain "read once, write once" here would let the last writer
+    // silently discard every other group's new questions (a lost update),
+    // or hand two groups the same question numbers (merge_into_group
+    // discards whatever number the model returned and renumbers from
+    // `start_number`, so that number has to come from live state too).
+    let mut tx = pool.begin().await?;
+    let latest_raw_config = sqlx::query_scalar!(r#"select quiz_config from module_items where id = $1 for update"#, bp.item_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten()
+        .ok_or(AppError::NotFound("quiz_config_not_found"))?;
+    let latest_quiz: QuizConfig = quiz_config_schema::parse(&latest_raw_config)?;
+    let fresh_start_number = match bp.mode {
+        GenerationMode::Append => start_number_for(&latest_quiz, "").max(start_number_for(&latest_quiz, &bp.group_id)),
+        _ => start_number_for(&latest_quiz, &bp.group_id),
+    };
+
+    let mut next_config = latest_raw_config.clone();
     let Some(groups) = next_config.get_mut("question_groups").and_then(|g| g.as_array_mut()) else {
         return Err(AppError::Internal(anyhow::anyhow!("quiz_config lost its question_groups")));
     };
     let Some(target) = groups.iter_mut().find(|g| g.get("group_id").and_then(|v| v.as_str()) == Some(bp.group_id.as_str())) else {
         return Err(AppError::NotFound("question_group_not_found"));
     };
+    if let Some(new_subtype) = &bp.convert_to_subtype {
+        target["type"] = serde_json::json!(new_subtype);
+    }
+    // Fase 5d — an author-unreviewed group is marked draft so the
+    // builder can surface it for approval before submit-review.
+    if bp.mark_draft {
+        target["ai_meta"] = serde_json::json!({ "draft": true });
+    }
     let spec = quiz_shape::spec(info.shape);
     let (question_count, emitted) = merge_into_group(
         target,
         &parsed,
         spec.emits,
-        start_number,
+        fresh_start_number,
         bp.mode,
         bp.question_number.as_deref(),
     );
@@ -656,7 +846,7 @@ pub async fn generate_quiz_group(
     if question_count == 0 {
         tracing::warn!(%ai_task_id, raw_output = %generation.text, "quiz generation returned no questions");
         record_failed(pool, ai_task_id, ctx.user_id, model).await;
-        return Err(AppError::AiOutputValidationFailed);
+        return Err(AppError::AiOutputValidationFailed(Some("Model tidak mengembalikan soal apa pun.".to_string())));
     }
 
     // Refuse to save something the engine could not then dispatch — a
@@ -668,12 +858,313 @@ pub async fn generate_quiz_group(
     })?;
 
     sqlx::query!(r#"update module_items set quiz_config = $2 where id = $1"#, bp.item_id, next_config)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
 
     ai_task::insert_done(pool, ai_task_id, ctx.user_id, "quiz_group_generation", PROVIDER, model, PROMPT_ID, generation.tokens_used.map(|t| t as i32)).await?;
 
     Ok(QuizGenerationResponse { ai_task_id, status: "done", group_id: bp.group_id, question_count, emitted })
+}
+
+// POST /ai/quiz/convert-group-type — reshape a group into a different
+// subtype, preserving its content instead of inventing new material. A
+// thin wrapper around `generate_quiz_group`: it builds a conversion
+// instruction out of the group's CURRENT content as `context_prompt`
+// (source subtype, existing question stems, passage) and sets
+// `convert_to_subtype`, which is what actually makes generate_quiz_group
+// build the prompt from the new subtype's shape and write the new type
+// onto the group — every other guarantee (retry, row-locked merge,
+// real error detail, ai_tasks bookkeeping) comes for free from there.
+// Also used to turn a document-import block into a group from scratch —
+// the "existing content" is then the block's own extracted text, not a
+// prior group's questions (see suggest_group_types).
+pub async fn convert_group_type(
+    pool: &PgPool,
+    config: &Config,
+    ai: &dyn AIProvider,
+    storage: &dyn AssetStorage,
+    ctx: &AuthContext,
+    model: &str,
+    item_id: Uuid,
+    group_id: String,
+    new_subtype: String,
+) -> Result<QuizGenerationResponse, AppError> {
+    let raw_config = sqlx::query_scalar!(r#"select quiz_config from module_items where id = $1"#, item_id)
+        .fetch_optional(pool)
+        .await?
+        .flatten()
+        .ok_or(AppError::NotFound("quiz_config_not_found"))?;
+    let quiz: QuizConfig = quiz_config_schema::parse(&raw_config)?;
+    let group = find_group(&quiz, &group_id).ok_or(AppError::NotFound("question_group_not_found"))?;
+    let old_info = quiz_subtype::find(&group.r#type)
+        .ok_or_else(|| AppError::UnprocessableEntity("unknown_subtype", format!("subtype \"{}\" tidak dikenal", group.r#type)))?;
+    let new_info = quiz_subtype::find(&new_subtype).ok_or_else(|| AppError::UnprocessableEntity("unknown_subtype", format!("subtype \"{new_subtype}\" tidak dikenal")))?;
+
+    let existing: Vec<String> = group.questions.iter().filter_map(|q| q.prompt_text().map(|t| t.chars().take(200).collect::<String>())).collect();
+    let mut conversion_brief = format!(
+        "KONVERSI TIPE SOAL: ubah grup ini dari \"{}\" menjadi \"{}\". Pertahankan topik dan makna tiap soal — HANYA bentuk/formatnya yang berubah ke tipe baru, JANGAN mengarang materi baru yang tidak berhubungan.\n",
+        old_info.label, new_info.label,
+    );
+    if !existing.is_empty() {
+        conversion_brief.push_str(&format!("\nSoal-soal yang harus disesuaikan bentuknya:\n- {}\n", existing.join("\n- ")));
+    }
+    if let Some(context) = group.context_prompt.as_deref().filter(|s| !s.trim().is_empty()) {
+        conversion_brief.push_str(&format!("\nKonteks tambahan dari penulis: {context}\n"));
+    }
+
+    let count = group.questions.len().clamp(1, 50) as i64;
+    let bp = QuizGenerationBlueprint {
+        item_id,
+        group_id,
+        mode: GenerationMode::Replace,
+        question_number: None,
+        count,
+        context_prompt: Some(conversion_brief),
+        reference_module_item_ids: Vec::new(),
+        asset_id: None,
+        raw_text: None,
+        convert_to_subtype: Some(new_subtype),
+        // Fase 5d — a reshape can lose fidelity; the author reviews it
+        // like any other automated fill before it counts as finished.
+        mark_draft: true,
+    };
+    generate_quiz_group(pool, config, ai, storage, ctx, model, bp).await
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct SuggestedBlock {
+    pub subtype: String,
+    pub count: i64,
+    /// The source text this block should be generated FROM — carried
+    /// into each block's own `context_prompt` once the author applies
+    /// the manifest, so "Generate soal" per group starts already primed
+    /// with the right material instead of an empty brief.
+    pub excerpt: String,
+    pub instruction: String,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct SuggestedSection {
+    pub title: String,
+    pub context_prompt: String,
+    pub blocks: Vec<SuggestedBlock>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct SuggestGroupTypesResponse {
+    pub ai_task_id: Uuid,
+    pub sections: Vec<SuggestedSection>,
+}
+
+const SUGGEST_PROMPT_ID: &str = "quiz_suggest_group_types_v1";
+/// A document can be huge; this keeps the prompt (and the bill) bounded
+/// without truncating so hard the model loses the document's shape.
+const SUGGEST_DOCUMENT_CHAR_LIMIT: usize = 20_000;
+
+fn suggest_group_types_system_prompt() -> String {
+    let catalog: Vec<String> = quiz_subtype::SUBTYPES
+        .iter()
+        .filter(|s| !matches!(s.shape, quiz_subtype::SubtypeShape::InteractiveEmbed))
+        .map(|s| format!("- {}: {} — {}", s.id, s.label, s.description))
+        .collect();
+    format!(
+        "Anda adalah asisten penyusun struktur kuis untuk platform belajar Indonesia. Baca dokumen yang diberikan dan usulkan struktur bagian + grup soal yang cocok — JANGAN menulis soalnya sendiri, hanya usulkan strukturnya.\n\n\
+TIPE SOAL YANG TERSEDIA (pakai HANYA id di sini untuk field \"subtype\"):\n{}\n\n\
+Keluarkan HANYA JSON, tanpa prosa, dengan bentuk ini (contoh terisi):\n\
+{{\"sections\": [{{\"title\": \"Bacaan 1\", \"context_prompt\": \"Ringkasan singkat isi bagian ini, untuk dipakai AI saat generate soal.\", \"blocks\": [{{\"subtype\": \"multiple_choice\", \"count\": 5, \"excerpt\": \"cuplikan teks sumber untuk blok ini, maks 500 karakter\", \"instruction\": \"Pilih jawaban yang paling tepat.\"}}]}}]}}\n\n\
+ATURAN:\n\
+- Kelompokkan berdasarkan struktur dokumen yang sebenarnya (bab, bagian, topik) — jangan memaksakan satu bagian untuk seluruh dokumen.\n\
+- Pilih tipe soal yang benar-benar cocok dengan bentuk materinya (bacaan panjang → multiple_choice/true_false_not_given, daftar istilah → word_match/vocab_cloze, dan seterusnya).\n\
+- `count` wajar untuk panjang materi tiap bagian (jangan mengarang puluhan soal untuk satu paragraf pendek).\n\
+- `excerpt` WAJIB berupa kutipan asli dari dokumen, bukan ringkasan karangan.",
+        catalog.join("\n"),
+    )
+}
+
+async fn record_suggest_failed(pool: &PgPool, ai_task_id: Uuid, user_id: Uuid, model: &str) {
+    if let Err(e) = ai_task::insert_failed(pool, ai_task_id, user_id, "quiz_suggest_group_types", PROVIDER, model, SUGGEST_PROMPT_ID).await {
+        tracing::error!(error = ?e, %ai_task_id, "failed to record failed ai_tasks row");
+    }
+}
+
+// POST /ai/quiz/suggest-group-types — a document's text in, a proposed
+// section + block manifest out. Produces no quiz content itself: the
+// author reviews/edits the manifest, then each block becomes a real
+// group via `convert_group_type` (used here as "materialize a block
+// into a group", the same operation that also reshapes an existing
+// group — see that function's doc comment).
+pub async fn suggest_group_types(pool: &PgPool, ai: &dyn AIProvider, ctx: &AuthContext, model: &str, document_text: &str) -> Result<SuggestGroupTypesResponse, AppError> {
+    require_permission(ctx, Resource::ModuleItem, Action::Create)?;
+    let document_text = document_text.trim();
+    if document_text.is_empty() {
+        return Err(AppError::UnprocessableEntity("document_text_required", "teks dokumen wajib diisi".to_string()));
+    }
+    let truncated: String = document_text.chars().take(SUGGEST_DOCUMENT_CHAR_LIMIT).collect();
+
+    let ai_task_id = Uuid::new_v4();
+    let max_tokens = resolve_max_tokens(model, 6000).await;
+    let request = GenerationRequest {
+        model: model.to_string(),
+        system_prompt: suggest_group_types_system_prompt(),
+        user_prompt: format!("DOKUMEN:\n{truncated}\n\nUsulkan struktur bagian dan grup soal yang cocok untuk dokumen ini."),
+        temperature: 0.3,
+        max_tokens,
+        image_url: None,
+        json_mode: true,
+    };
+
+    // One retry on the SAME provider — never falls back to a different
+    // one. A suggested subtype the registry doesn't recognize is
+    // dropped from its block rather than failing the whole manifest —
+    // the author still gets a usable structure for everything else.
+    let mut outcome = None;
+    let mut last_error = String::new();
+    for attempt in 0..2 {
+        let generation = match ai.generate(request.clone()).await {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(error = ?e, %ai_task_id, attempt, "quiz suggest-group-types provider call failed");
+                last_error = format!("Provider gagal: {e}");
+                continue;
+            }
+        };
+        #[derive(serde::Deserialize)]
+        struct Manifest {
+            #[serde(default)]
+            sections: Vec<SuggestedSection>,
+        }
+        match serde_json::from_str::<Manifest>(&strip_code_fence(&generation.text)) {
+            Ok(manifest) if !manifest.sections.is_empty() => {
+                let sections: Vec<SuggestedSection> = manifest
+                    .sections
+                    .into_iter()
+                    .map(|mut s| {
+                        s.blocks.retain(|b| quiz_subtype::find(&b.subtype).is_some());
+                        s
+                    })
+                    .filter(|s| !s.blocks.is_empty())
+                    .collect();
+                if sections.is_empty() {
+                    tracing::warn!(%ai_task_id, attempt, raw_output = %generation.text, "quiz suggest-group-types returned no usable sections after filtering unknown subtypes");
+                    last_error = "Model tidak mengusulkan tipe soal yang dikenali.".to_string();
+                    continue;
+                }
+                outcome = Some(sections);
+                break;
+            }
+            Ok(_) => {
+                tracing::warn!(%ai_task_id, attempt, raw_output = %generation.text, "quiz suggest-group-types returned no sections");
+                last_error = "Model tidak mengusulkan bagian apa pun.".to_string();
+            }
+            Err(e) => {
+                tracing::warn!(%ai_task_id, attempt, raw_output = %generation.text, "quiz suggest-group-types output failed to parse");
+                last_error = format!("Model tidak mengembalikan JSON yang valid: {e}");
+            }
+        }
+    }
+    let Some(sections) = outcome else {
+        record_suggest_failed(pool, ai_task_id, ctx.user_id, model).await;
+        return Err(AppError::AiOutputValidationFailed(Some(last_error)));
+    };
+
+    ai_task::insert_done(pool, ai_task_id, ctx.user_id, "quiz_suggest_group_types", PROVIDER, model, SUGGEST_PROMPT_ID, None).await?;
+    Ok(SuggestGroupTypesResponse { ai_task_id, sections })
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct BatchGroupResult {
+    pub group_id: String,
+    pub status: &'static str,
+    pub question_count: Option<usize>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct BatchGenerationResponse {
+    pub results: Vec<BatchGroupResult>,
+}
+
+/// What a client would see from `generate_quiz_group` directly, so a
+/// batch failure reads the same as a single-group one — the real
+/// message when there is one (e.g. the provider's own error, via
+/// `AiOutputValidationFailed`), else the bare error code.
+fn error_message(e: &AppError) -> String {
+    match e {
+        AppError::AiOutputValidationFailed(Some(detail)) => detail.clone(),
+        AppError::AiOutputValidationFailed(None) => "ai_output_validation_failed".to_string(),
+        AppError::NotFound(code) | AppError::UnprocessableEntity(code, _) | AppError::ForbiddenWithCode(code) => code.to_string(),
+        AppError::Forbidden => "forbidden".to_string(),
+        _ => "generation_failed".to_string(),
+    }
+}
+
+// POST /ai/quiz/generate-batch — fills every still-empty group in one
+// item. One group's failure (a bad model reply, an unsupported shape)
+// must not take the others down with it, so each group's outcome is
+// reported individually rather than the whole call erroring out.
+pub async fn generate_batch(
+    pool: &PgPool,
+    config: &Config,
+    ai: &dyn AIProvider,
+    storage: &dyn AssetStorage,
+    ctx: &AuthContext,
+    model: &str,
+    item_id: Uuid,
+    count: i64,
+) -> Result<BatchGenerationResponse, AppError> {
+    require_permission(ctx, Resource::ModuleItem, Action::Create)?;
+
+    let raw_config = sqlx::query_scalar!(r#"select quiz_config from module_items where id = $1"#, item_id)
+        .fetch_optional(pool)
+        .await?
+        .flatten()
+        .ok_or(AppError::NotFound("quiz_config_not_found"))?;
+    let quiz: QuizConfig = quiz_config_schema::parse(&raw_config)?;
+
+    // "Still empty" and actually generatable — a hand-authored subtype
+    // (H5P, a live speaking activity) has nothing for the model to fill.
+    let targets: Vec<String> = quiz
+        .question_groups
+        .iter()
+        .filter(|g| g.questions.is_empty())
+        .filter(|g| {
+            quiz_subtype::find(&g.r#type).is_some_and(|info| !matches!(info.shape, quiz_subtype::SubtypeShape::InteractiveEmbed))
+        })
+        .map(|g| g.group_id.clone())
+        .collect();
+
+    let results = stream::iter(targets.into_iter().map(|group_id| {
+        let bp = QuizGenerationBlueprint {
+            item_id,
+            group_id: group_id.clone(),
+            mode: GenerationMode::Replace,
+            question_number: None,
+            count,
+            context_prompt: None,
+            reference_module_item_ids: Vec::new(),
+            asset_id: None,
+            raw_text: None,
+            convert_to_subtype: None,
+            // Fase 5d — filled without the author looking at any one
+            // group individually.
+            mark_draft: true,
+        };
+        async move {
+            match generate_quiz_group(pool, config, ai, storage, ctx, model, bp).await {
+                Ok(resp) => BatchGroupResult { group_id, status: "done", question_count: Some(resp.question_count), error: None },
+                Err(e) => {
+                    tracing::warn!(error = ?e, %group_id, %item_id, "batch generation failed for one group");
+                    BatchGroupResult { group_id, status: "failed", question_count: None, error: Some(error_message(&e)) }
+                }
+            }
+        }
+    }))
+    .buffer_unordered(BATCH_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+
+    Ok(BatchGenerationResponse { results })
 }
 
 #[cfg(test)]
@@ -768,7 +1259,7 @@ mod tests {
         let group = find_group(&config, "g").unwrap();
         let info = quiz_subtype::find("multiple_choice").unwrap();
         let target = serde_json::to_value(&group.questions[0]).unwrap();
-        let (system, user) = build_prompt(&config, group, info, GenerationMode::AnswerOnly, Some(&target), 1, None, 1, false, "");
+        let (system, user) = build_prompt(&config, group, info, GenerationMode::AnswerOnly, Some(&target), 1, None, 1, false, "", None);
         assert!(system.contains("JANGAN mengubah pertanyaan"));
         assert!(user.contains("Berapa 2+2?"), "the model must see the question it is answering");
     }
@@ -782,9 +1273,30 @@ mod tests {
         let group = find_group(&config, "g").unwrap();
         let info = quiz_subtype::find("multiple_choice").unwrap();
         let target = serde_json::to_value(&group.questions[0]).unwrap();
-        let (_, user) = build_prompt(&config, group, info, GenerationMode::Rewrite, Some(&target), 1, None, 1, false, "");
+        let (_, user) = build_prompt(&config, group, info, GenerationMode::Rewrite, Some(&target), 1, None, 1, false, "", None);
         assert!(user.contains("Tulis ULANG"));
         assert!(user.contains("Soal yang kurang jelas"));
+        assert!(user.contains("pertahankan topik dan tingkat kesulitannya"), "with no instruction, the model is told to preserve difficulty");
+    }
+
+    #[test]
+    fn a_rewrite_instruction_is_allowed_to_change_difficulty_instead_of_fighting_it() {
+        // Editing one question ("jadikan lebih sulit") reuses Rewrite
+        // mode with `context_prompt` as the instruction — the fixed
+        // "keep the same difficulty" text must not survive to contradict
+        // an instruction that explicitly asks to change it.
+        let config = config_with(json!({
+            "group_id": "g", "type": "multiple_choice",
+            "questions": [{"number": 1, "stem": "Soal mudah"}],
+        }));
+        let group = find_group(&config, "g").unwrap();
+        let info = quiz_subtype::find("multiple_choice").unwrap();
+        let target = serde_json::to_value(&group.questions[0]).unwrap();
+        let (_, user) = build_prompt(&config, group, info, GenerationMode::Rewrite, Some(&target), 1, Some("jadikan lebih sulit"), 1, false, "", None);
+        assert!(user.contains("Tulis ULANG"));
+        assert!(user.contains("mengikuti instruksi tambahan"));
+        assert!(!user.contains("pertahankan topik dan tingkat kesulitannya"));
+        assert!(user.contains("Panduan penulis: jadikan lebih sulit"));
     }
 
     #[test]
@@ -831,7 +1343,7 @@ mod tests {
         let config = config_with(json!({"group_id": "g", "type": "multiple_choice", "questions": []}));
         let group = find_group(&config, "g").unwrap();
         let info = quiz_subtype::find("multiple_choice").unwrap();
-        let (system, _) = build_prompt(&config, group, info, GenerationMode::Replace, None, 1, None, 1, false, "");
+        let (system, _) = build_prompt(&config, group, info, GenerationMode::Replace, None, 1, None, 1, false, "", None);
         assert!(system.contains("ditulis ganda"), "the prompt must demand double-escaped backslashes");
     }
 
@@ -897,12 +1409,33 @@ mod tests {
         let config = config_with(json!({"group_id": "g", "type": "multiple_choice", "questions": []}));
         let group = find_group(&config, "g").unwrap();
         let info = quiz_subtype::find("multiple_choice").unwrap();
-        let (system, user) = build_prompt(&config, group, info, GenerationMode::Replace, None, 3, Some("Tentang fotosintesis"), 1, false, "");
+        let (system, user) = build_prompt(&config, group, info, GenerationMode::Replace, None, 3, Some("Tentang fotosintesis"), 1, false, "", None);
         assert!(system.contains("explanation"), "prompt must demand explanations");
+        // A LaTeX "number line" renders in a proportional font, so its
+        // labels drift away from its ticks — found live in the pilot.
+        assert!(system.contains("JANGAN menggambar diagram"), "prompt must forbid LaTeX/ASCII diagrams");
+        assert!(system.contains("blok kode ```"), "and point at the monospace code block instead");
         assert!(system.contains("mengapa pengecoh"), "prompt must demand distractor analysis");
         assert!(system.contains("Tepat 4 pilihan"), "shape rules must be included");
         assert!(user.contains("Buat 3 soal"));
         assert!(user.contains("Tentang fotosintesis"));
+    }
+
+    // Regression — highlight_incorrect_words failed AI generation in
+    // every attempt across the Phase 38 QA sweep ("Model tidak
+    // mengembalikan soal apa pun"). Root cause: it hard-caps at ONE
+    // question (scored as a set over the whole transcript), but every
+    // caller here requested 2-4, and the contradiction between "Buat 3
+    // soal" and the shape's own "satu grup hanya berisi SATU soal" rule
+    // reliably produced zero questions instead of either number.
+    #[test]
+    fn highlight_words_ignores_the_requested_count_and_always_asks_for_one() {
+        let config = config_with(json!({"group_id": "g", "type": "highlight_incorrect_words", "questions": []}));
+        let group = find_group(&config, "g").unwrap();
+        let info = quiz_subtype::find("highlight_incorrect_words").unwrap();
+        let (_, user) = build_prompt(&config, group, info, GenerationMode::Replace, None, 3, None, 1, false, "", None);
+        assert!(user.contains("Buat 1 soal"), "user prompt: {user}");
+        assert!(!user.contains("Buat 3 soal"));
     }
 
     #[test]
@@ -913,7 +1446,7 @@ mod tests {
         }));
         let group = find_group(&config, "g").unwrap();
         let info = quiz_subtype::find("multiple_choice").unwrap();
-        let (system, _) = build_prompt(&config, group, info, GenerationMode::Replace, None, 3, None, 1, false, "");
+        let (system, _) = build_prompt(&config, group, info, GenerationMode::Replace, None, 3, None, 1, false, "", None);
         assert!(system.contains("option_scores"));
         assert!(system.contains("JANGAN tulis `answer`"));
     }
@@ -923,7 +1456,7 @@ mod tests {
         let config = config_with(json!({"group_id": "g", "type": "matching", "display_mode": "ielts", "questions": []}));
         let group = find_group(&config, "g").unwrap();
         let info = quiz_subtype::find("matching").unwrap();
-        let (system, _) = build_prompt(&config, group, info, GenerationMode::Replace, None, 4, None, 1, false, "");
+        let (system, _) = build_prompt(&config, group, info, GenerationMode::Replace, None, 4, None, 1, false, "", None);
         assert!(system.contains("word bank"), "the drag-and-drop variant rule must be present");
     }
 
@@ -936,7 +1469,7 @@ mod tests {
         }));
         let group = find_group(&config, "g").unwrap();
         let info = quiz_subtype::find("true_false_not_given").unwrap();
-        let (_, user) = build_prompt(&config, group, info, GenerationMode::Replace, None, 3, None, 1, false, "");
+        let (_, user) = build_prompt(&config, group, info, GenerationMode::Replace, None, 3, None, 1, false, "", None);
         assert!(user.contains("Lebah menyerbuki"));
         assert!(!user.contains("Tulis juga bacaannya"));
     }
@@ -946,9 +1479,33 @@ mod tests {
         let config = config_with(json!({"group_id": "g", "type": "multiple_choice", "questions": []}));
         let group = find_group(&config, "g").unwrap();
         let info = quiz_subtype::find("multiple_choice").unwrap();
-        let (_, user) = build_prompt(&config, group, info, GenerationMode::Replace, None, 5, None, 1, true, "");
+        let (_, user) = build_prompt(&config, group, info, GenerationMode::Replace, None, 5, None, 1, true, "", None);
         assert!(user.contains("EKSTRAK"), "image mode must tell the model to extract, not invent");
         assert!(user.contains("JANGAN mengarang"));
+    }
+
+    #[test]
+    fn pasted_raw_text_switches_from_inventing_to_extracting_too() {
+        // "Tempel & Parse" — the same extraction instruction as image
+        // mode, but the source is text the author pasted rather than an
+        // attached photo.
+        let config = config_with(json!({"group_id": "g", "type": "multiple_choice", "questions": []}));
+        let group = find_group(&config, "g").unwrap();
+        let info = quiz_subtype::find("multiple_choice").unwrap();
+        let (_, user) = build_prompt(&config, group, info, GenerationMode::Replace, None, 5, None, 1, false, "", Some("1. Apa ibu kota Perancis?\nA. Lyon B. Paris"));
+        assert!(user.contains("EKSTRAK"), "pasted-text mode must tell the model to extract, not invent");
+        assert!(user.contains("JANGAN mengarang"));
+        assert!(user.contains("Apa ibu kota Perancis"), "the pasted source text must actually reach the model");
+    }
+
+    #[test]
+    fn image_mode_wins_over_pasted_text_when_somehow_both_are_set() {
+        let config = config_with(json!({"group_id": "g", "type": "multiple_choice", "questions": []}));
+        let group = find_group(&config, "g").unwrap();
+        let info = quiz_subtype::find("multiple_choice").unwrap();
+        let (_, user) = build_prompt(&config, group, info, GenerationMode::Replace, None, 5, None, 1, true, "", Some("teks yang harusnya diabaikan"));
+        assert!(user.contains("gambar/dokumen terlampir"));
+        assert!(!user.contains("teks yang harusnya diabaikan"));
     }
 
     #[test]
@@ -967,6 +1524,7 @@ mod tests {
             1,
             false,
             "ITEM RUJUKAN (item lain di modul yang sama — pakai untuk konsistensi lintas item, JANGAN salin isinya):\n--- @@Kuis Sebelumnya (quiz) ---\nSoal yang SUDAH ADA di kuis ini (jangan diulang):\n- Apa ibu kota Indonesia?\n",
+            None,
         );
         assert!(user.contains("ITEM RUJUKAN"));
         assert!(user.contains("Apa ibu kota Indonesia?"));
@@ -977,7 +1535,7 @@ mod tests {
         let config = config_with(json!({"group_id": "g", "type": "multiple_choice", "questions": []}));
         let group = find_group(&config, "g").unwrap();
         let info = quiz_subtype::find("multiple_choice").unwrap();
-        let (_, user) = build_prompt(&config, group, info, GenerationMode::Replace, None, 3, None, 1, false, "");
+        let (_, user) = build_prompt(&config, group, info, GenerationMode::Replace, None, 3, None, 1, false, "", None);
         assert!(!user.contains("ITEM RUJUKAN"));
     }
 
@@ -989,8 +1547,53 @@ mod tests {
         }));
         let group = find_group(&config, "g").unwrap();
         let info = quiz_subtype::find("multiple_choice").unwrap();
-        let (_, user) = build_prompt(&config, group, info, GenerationMode::Replace, None, 2, None, 2, false, "");
+        let (_, user) = build_prompt(&config, group, info, GenerationMode::Replace, None, 2, None, 2, false, "", None);
         assert!(user.contains("jangan diulang"));
         assert!(user.contains("Apa ibu kota Indonesia?"));
     }
+
+    #[test]
+    fn sibling_questions_are_listed_with_their_source_and_framed_as_same_skill_not_same_text() {
+        let block = sibling_questions_block(&[
+            SiblingQuestion { source: "Latihan — Membaca Posisi Bilangan".into(), stem: "Titik pusat pada garis bilangan disebut titik ...".into() },
+            SiblingQuestion { source: "Latihan — Lawan Bilangan".into(), stem: "Pasangan bilangan berjarak sama dari nol disebut ...".into() },
+        ]);
+        assert!(block.contains("- [Latihan — Membaca Posisi Bilangan] Titik pusat pada garis bilangan disebut titik ..."));
+        assert!(block.contains("- [Latihan — Lawan Bilangan]"));
+        // The pilot's duplicates were reworded, not copied — the rule
+        // has to cover a paraphrase too.
+        assert!(block.contains("termasuk bila kalimatnya diubah"));
+        assert!(block.contains("KHAS bab ini"));
+    }
+
+    #[test]
+    fn no_siblings_adds_nothing_to_the_prompt() {
+        assert_eq!(sibling_questions_block(&[]), "");
+    }
+
+    #[test]
+    fn a_long_stimulus_is_clipped_to_what_identifies_the_question() {
+        let long = format!("Perhatikan data\n\nberikut:   {}", "suhu ".repeat(80));
+        let clipped = clip_stem(&long);
+        assert!(clipped.starts_with("Perhatikan data berikut: suhu"), "whitespace collapsed: {clipped}");
+        assert!(clipped.ends_with('…'));
+        assert_eq!(clipped.chars().count(), SIBLING_STEM_CHARS + 1);
+        assert_eq!(clip_stem("pendek"), "pendek");
+    }
+
+    #[test]
+    fn stems_come_from_every_group_and_skip_questions_without_one() {
+        let config: QuizConfig = serde_json::from_value(json!({
+            "sections": [],
+            "question_groups": [
+                {"group_id": "g1", "type": "multiple_choice", "questions": [{"number": 1, "stem": "Satu"}, {"number": 2, "answer": "A"}]},
+                {"group_id": "g2", "type": "true_false", "questions": [{"number": 3, "text": "Dua"}]},
+            ],
+        }))
+        .unwrap();
+        let stems = stems_of("Latihan X", &config.question_groups);
+        assert_eq!(stems.iter().map(|s| s.stem.as_str()).collect::<Vec<_>>(), vec!["Satu", "Dua"]);
+        assert!(stems.iter().all(|s| s.source == "Latihan X"));
+    }
+
 }

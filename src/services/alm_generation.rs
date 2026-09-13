@@ -70,35 +70,48 @@ pub async fn generate_fragment(pool: &PgPool, ai: &dyn AIProvider, model: &str, 
 
     let ai_task_id = Uuid::new_v4();
     let max_tokens = resolve_max_tokens(model, 3000).await;
-    let generation = match ai
-        .generate(GenerationRequest {
-            model: model.to_string(),
-            system_prompt: system_prompt(),
-            user_prompt: instruction.to_string(),
-            temperature: 0.6,
-            max_tokens,
-            image_url: None,
-            json_mode: false,
-        })
-        .await
-    {
-        Ok(g) => g,
-        Err(e) => {
-            tracing::warn!(error = ?e, provider = PROVIDER, prompt_id = PROMPT_ID, "alm fragment generation failed");
-            let _ = ai_task::insert_failed(pool, ai_task_id, ctx.user_id, "alm_fragment", PROVIDER, model, PROMPT_ID).await;
-            return Err(AppError::AiOutputValidationFailed);
-        }
+    let request = GenerationRequest {
+        model: model.to_string(),
+        system_prompt: system_prompt(),
+        user_prompt: instruction.to_string(),
+        temperature: 0.6,
+        max_tokens,
+        image_url: None,
+        json_mode: false,
     };
 
-    // sanitize_generated guarantees parseable ALM back (demoting any
-    // block the schema rejects to prose) rather than handing the editor
-    // text it would refuse to load.
-    let content = lesson_plan::sanitize_generated(&strip_code_fence(&generation.text));
-    if content.trim().is_empty() {
-        let _ = ai_task::insert_failed(pool, ai_task_id, ctx.user_id, "alm_fragment", PROVIDER, model, PROMPT_ID).await;
-        return Err(AppError::AiOutputValidationFailed);
+    // One retry on the SAME provider — never falls back to a different
+    // one; sanitize_generated's own "the schema rejected everything"
+    // case (empty content) also gets a second attempt, same as a
+    // straight provider failure.
+    let mut outcome = None;
+    let mut last_error = String::new();
+    for attempt in 0..2 {
+        let generation = match ai.generate(request.clone()).await {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(error = ?e, %ai_task_id, attempt, provider = PROVIDER, prompt_id = PROMPT_ID, "alm fragment generation failed");
+                last_error = format!("Provider gagal: {e}");
+                continue;
+            }
+        };
+        // sanitize_generated guarantees parseable ALM back (demoting any
+        // block the schema rejects to prose) rather than handing the
+        // editor text it would refuse to load.
+        let content = lesson_plan::sanitize_generated(&strip_code_fence(&generation.text));
+        if content.trim().is_empty() {
+            tracing::warn!(%ai_task_id, attempt, raw_output = %generation.text, "alm fragment generation produced no usable content");
+            last_error = "Model tidak mengembalikan konten yang bisa dipakai.".to_string();
+            continue;
+        }
+        outcome = Some((content, generation.tokens_used));
+        break;
     }
-    ai_task::insert_done(pool, ai_task_id, ctx.user_id, "alm_fragment", PROVIDER, model, PROMPT_ID, generation.tokens_used.map(|t| t as i32)).await?;
+    let Some((content, tokens_used)) = outcome else {
+        let _ = ai_task::insert_failed(pool, ai_task_id, ctx.user_id, "alm_fragment", PROVIDER, model, PROMPT_ID).await;
+        return Err(AppError::AiOutputValidationFailed(Some(last_error)));
+    };
+    ai_task::insert_done(pool, ai_task_id, ctx.user_id, "alm_fragment", PROVIDER, model, PROMPT_ID, tokens_used.map(|t| t as i32)).await?;
     Ok(GenerateFragmentResponse { content })
 }
 

@@ -21,6 +21,11 @@ pub struct AppState {
     pub google_verifier: GoogleTokenVerifier,
     pub payment_provider: Arc<dyn PaymentProvider>,
     pub ai_provider: Arc<dyn AIProvider>,
+    /// Pure text generation only (lesson/question/quiz generation,
+    /// writing/speaking/grammar evaluation, live chat) — Vertex AI
+    /// Gemini. OCR (vision), STT, and TTS stay on `ai_provider`
+    /// (OpenRouter) — see `services::vertex_ai_provider`.
+    pub text_ai_provider: Arc<dyn AIProvider>,
     pub meeting_provider: Arc<dyn MeetingProvider>,
     pub storage: Arc<dyn AssetStorage>,
     pub canvas_hub: Arc<CanvasHub>,
@@ -42,6 +47,16 @@ impl AppState {
         // per-org/per-tutor DB rows.
         let openrouter_api_key = std::env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY is required")?;
         let ai_provider: Arc<dyn AIProvider> = Arc::new(crate::services::ai_provider::DeepSeekProvider::new(openrouter_api_key));
+
+        // GCP migration — fails fast at boot if credentials can't be
+        // discovered (see vertex_ai_provider's module docs for the
+        // discovery order), same "required, not silently degraded"
+        // convention as OPENROUTER_API_KEY/R2 above.
+        let text_ai_provider: Arc<dyn AIProvider> = Arc::new(
+            crate::services::vertex_ai_provider::VertexGeminiProvider::new(config.gcp_project_id.clone(), config.gcp_region.clone())
+                .await
+                .context("failed to initialize Vertex AI Gemini provider — is `gcloud auth application-default login` set up?")?,
+        );
 
         // GoogleMeetProvider only when all 3 vars are set (a real
         // organizer account's credentials); StubMeetingProvider
@@ -73,6 +88,7 @@ impl AppState {
             google_verifier: GoogleTokenVerifier::new(),
             payment_provider: Arc::new(crate::services::payment_provider::StubQrisProvider),
             ai_provider,
+            text_ai_provider,
             meeting_provider,
             storage,
             canvas_hub: Arc::new(CanvasHub::new()),

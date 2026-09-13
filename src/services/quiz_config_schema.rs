@@ -185,6 +185,11 @@ pub fn find_issues(config: &Value) -> Vec<String> {
     for group in &parsed.question_groups {
         let id = &group.group_id;
         let subtype = &group.r#type;
+
+        if is_draft(group) {
+            issues.push(format!(r#"grup "{id}" ({subtype}) masih draft AI — tinjau sebelum diajukan"#));
+        }
+
         let Some(info) = quiz_subtype::find(subtype) else { continue };
 
         if group.questions.is_empty() {
@@ -203,9 +208,25 @@ pub fn find_issues(config: &Value) -> Vec<String> {
             issues.push(format!(r#"grup "{id}" ({subtype}) butuh audio tapi belum ada"#));
         }
 
+        // matching_headings/gap_fill's rich layout/table_completion/
+        // flow_chart legitimately carry NO per-question `stem` at all —
+        // the question is expressed entirely inline in the group's own
+        // shared structure (a passage section, a note-completion row, a
+        // table cell, a flow step; see quiz_shape.rs's schemas for each).
+        // Flagging every one of their questions as "missing" on every
+        // single quiz using them was a standing false positive, not a
+        // real gap — skip the stem check once that structure is there.
+        let prompt_lives_in_shared_structure = match info.shape {
+            quiz_subtype::SubtypeShape::MatchingHeadings => !group.passage_sections.is_empty(),
+            quiz_subtype::SubtypeShape::GapFillRich => !group.sections.is_empty(),
+            quiz_subtype::SubtypeShape::TableFill => !group.rows.is_empty(),
+            quiz_subtype::SubtypeShape::FlowFill => !group.flow.is_empty(),
+            _ => false,
+        };
+
         for question in &group.questions {
             let number = value_to_key(&question.number);
-            if question.prompt_text().is_none_or(str::is_empty) {
+            if !prompt_lives_in_shared_structure && question.prompt_text().is_none_or(str::is_empty) {
                 issues.push(format!(r#"grup "{id}" soal {number}: belum ada pertanyaan/instruksi"#));
             }
             // A deferred-grading subtype has no answer key by design —
@@ -217,9 +238,38 @@ pub fn find_issues(config: &Value) -> Vec<String> {
                 }
             }
         }
+
+        // Taxonomy (tingkat kesukaran + Bloom) is reported ONCE per
+        // group, not once per question. Every question in a bank
+        // written before the taxonomy existed is untagged, and a
+        // per-question issue would bury the real problems — a missing
+        // key, a missing stem — under hundreds of identical lines.
+        let untagged = group
+            .questions
+            .iter()
+            .filter(|q| q.taxonomy.as_ref().is_none_or(|t| t.difficulty.is_none() || t.bloom.is_none()))
+            .count();
+        if untagged > 0 && !group.questions.is_empty() {
+            issues.push(format!(
+                r#"grup "{id}": {untagged} dari {total} soal belum punya tingkat kesukaran & level Bloom"#,
+                total = group.questions.len()
+            ));
+        }
     }
 
     issues
+}
+
+fn is_draft(group: &crate::services::quiz_config::QuizQuestionGroup) -> bool {
+    group.ai_meta.as_ref().and_then(|m| m.get("draft")).and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// Fase 5d — the hard gate `submit_for_review` checks alongside the
+/// grammar Constitution check: an AI-drafted group the author hasn't
+/// approved yet must not reach the review queue unnoticed.
+pub fn has_draft_groups(config: &Value) -> bool {
+    let Ok(parsed) = parse(config) else { return false };
+    parsed.question_groups.iter().any(is_draft)
 }
 
 fn answer_is_empty(answer: &Value) -> bool {
@@ -285,6 +335,45 @@ mod tests {
             }],
         });
         assert!(validate_structure(&config).is_ok());
+        // Narrowed to what this test is actually about: sharing one
+        // passage across questions must raise no stem/key complaint.
+        // (An untagged deck separately reports its missing taxonomy.)
+        let issues = find_issues(&config);
+        assert!(!issues.iter().any(|i| i.contains("pertanyaan/instruksi") || i.contains("kunci jawaban")), "issues: {issues:?}");
+    }
+
+    #[test]
+    fn untagged_questions_are_reported_once_per_group_not_once_each() {
+        // A bank written before the taxonomy existed has hundreds of
+        // untagged questions. One line per question would bury the
+        // missing keys and missing stems that actually block a review.
+        let config = json!({
+            "sections": [],
+            "question_groups": [{
+                "group_id": "g1", "type": "multiple_choice",
+                "questions": [
+                    {"number": 1, "stem": "1 + 1 = ?", "answer": "2"},
+                    {"number": 2, "stem": "2 + 2 = ?", "answer": "4", "taxonomy": {"difficulty": "mudah", "bloom": "c1"}},
+                    {"number": 3, "stem": "3 + 3 = ?", "answer": "6", "taxonomy": {"difficulty": "mudah"}},
+                ],
+            }],
+        });
+        let flagged: Vec<_> = find_issues(&config).into_iter().filter(|i| i.contains("Bloom")).collect();
+        assert_eq!(flagged.len(), 1, "one line per group, got: {flagged:?}");
+        // Q1 has nothing and Q3 has only half the pair — both count.
+        assert!(flagged[0].contains("2 dari 3"), "{}", flagged[0]);
+    }
+
+    #[test]
+    fn a_fully_classified_group_raises_nothing_at_all() {
+        let config = json!({
+            "sections": [],
+            "question_groups": [{
+                "group_id": "g1", "type": "multiple_choice",
+                "questions": [{"number": 1, "stem": "1 + 1 = ?", "answer": "2",
+                               "taxonomy": {"difficulty": "sedang", "bloom": "c4"}}],
+            }],
+        });
         assert!(find_issues(&config).is_empty(), "issues: {:?}", find_issues(&config));
     }
 
@@ -430,7 +519,8 @@ mod tests {
             }],
         });
         assert!(validate_structure(&config).is_ok());
-        assert!(find_issues(&config).is_empty(), "issues: {:?}", find_issues(&config));
+        let issues = find_issues(&config);
+        assert!(!issues.iter().any(|i| i.contains("kunci jawaban")), "issues: {issues:?}");
     }
 
     #[test]
@@ -455,5 +545,76 @@ mod tests {
         });
         assert!(validate_structure(&config).is_ok());
         assert!(find_issues(&config).iter().any(|i| i.contains("belum punya soal")));
+    }
+
+    // Regression — the live QA sweep of every subtype (Phase 38) found
+    // this false-positive: matching_headings/gap_fill's rich layout/
+    // table_completion/flow_chart carry the question entirely inline in
+    // their own shared structure by design (see their schemas in
+    // quiz_shape.rs), not a per-question `stem` — every one of their
+    // questions was flagged "missing" even with complete, correct
+    // content, on every single quiz using them.
+    #[test]
+    fn a_question_expressed_only_in_the_shared_structure_is_not_flagged_as_missing() {
+        let config = json!({
+            "sections": [],
+            "question_groups": [{
+                "group_id": "g1", "type": "matching_headings",
+                "headings": [{"label": "i", "text": "A heading"}],
+                "passage_sections": [{"label": "A", "question_number": 1, "text": "Paragraph A"}],
+                "questions": [{"number": 1, "answer": "A heading"}],
+            }],
+        });
+        let issues = find_issues(&config);
+        assert!(!issues.iter().any(|i| i.contains("belum ada pertanyaan/instruksi")), "issues: {issues:?}");
+    }
+
+    #[test]
+    fn a_stemless_question_with_no_shared_structure_at_all_is_still_flagged() {
+        let config = json!({
+            "sections": [],
+            "question_groups": [{
+                "group_id": "g1", "type": "matching_headings",
+                "questions": [{"number": 1, "answer": "A heading"}],
+            }],
+        });
+        let issues = find_issues(&config);
+        assert!(issues.iter().any(|i| i.contains("belum ada pertanyaan/instruksi")), "issues: {issues:?}");
+    }
+
+    #[test]
+    fn a_draft_group_is_flagged_and_counted() {
+        let config = json!({
+            "sections": [],
+            "question_groups": [{
+                "group_id": "g1", "type": "multiple_choice", "ai_meta": {"draft": true},
+                "questions": [{"number": 1, "stem": "a", "answer": "A"}],
+            }],
+        });
+        assert!(validate_structure(&config).is_ok());
+        assert!(find_issues(&config).iter().any(|i| i.contains("draft AI")));
+        assert!(has_draft_groups(&config));
+    }
+
+    #[test]
+    fn an_approved_group_is_neither_flagged_nor_counted() {
+        let config = json!({
+            "sections": [],
+            "question_groups": [{
+                "group_id": "g1", "type": "multiple_choice", "ai_meta": {"draft": false},
+                "questions": [{"number": 1, "stem": "a", "answer": "A"}],
+            }],
+        });
+        assert!(!find_issues(&config).iter().any(|i| i.contains("draft AI")));
+        assert!(!has_draft_groups(&config));
+    }
+
+    #[test]
+    fn a_group_with_no_ai_meta_at_all_is_not_a_draft() {
+        let config = json!({
+            "sections": [],
+            "question_groups": [{"group_id": "g1", "type": "multiple_choice", "questions": [{"number": 1, "stem": "a", "answer": "A"}]}],
+        });
+        assert!(!has_draft_groups(&config));
     }
 }

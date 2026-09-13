@@ -113,10 +113,12 @@ fn answer_asset_id(value: &serde_json::Value) -> Option<Uuid> {
     Uuid::parse_str(raw).ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn submit_quiz_attempt(
     pool: &PgPool,
     config: &Config,
     ai: &dyn AIProvider,
+    text_ai: &dyn AIProvider,
     storage: &dyn AssetStorage,
     ctx: &AuthContext,
     attempt_id: Uuid,
@@ -161,7 +163,7 @@ pub async fn submit_quiz_attempt(
                     (Some(score.is_correct), None, false, score.points_earned as f64, score.points_max as f64)
                 }
                 quiz_subtype::GradingMode::AiRubric => {
-                    let score = evaluate_with_rubric(pool, config, ai, storage, ctx, attempt_id, subtype, &submitted).await?;
+                    let score = evaluate_with_rubric(pool, config, ai, text_ai, storage, ctx, attempt_id, subtype, &submitted).await?;
                     // An un-scored rubric question (empty submission, or
                     // the provider failed) contributes 0 of 1 rather than
                     // silently shrinking the denominator.
@@ -224,6 +226,7 @@ async fn evaluate_with_rubric(
     pool: &PgPool,
     config: &Config,
     ai: &dyn AIProvider,
+    text_ai: &dyn AIProvider,
     storage: &dyn AssetStorage,
     ctx: &AuthContext,
     attempt_id: Uuid,
@@ -238,7 +241,7 @@ async fn evaluate_with_rubric(
             }
             Ok(ai_writing_evaluation::run_writing_evaluation(
                 pool,
-                ai,
+                text_ai,
                 &config.ai_writing_evaluation_model,
                 ctx.user_id,
                 attempt_id,
@@ -256,7 +259,7 @@ async fn evaluate_with_rubric(
             let Some((bytes, content_type)) = read_audio_bytes(pool, storage, ctx, asset_id).await? else {
                 return Ok(None);
             };
-            let result = ai_speaking_evaluation::run_speaking_evaluation(pool, config, ai, ctx.user_id, attempt_id, &bytes, &content_type, None).await;
+            let result = ai_speaking_evaluation::run_speaking_evaluation(pool, config, ai, text_ai, ctx.user_id, attempt_id, &bytes, &content_type, None).await;
             Ok(result.evaluation.map(|e| e.scores.overall))
         }
         _ => Ok(None),

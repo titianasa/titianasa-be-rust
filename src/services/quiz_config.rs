@@ -250,6 +250,11 @@ pub struct QuizQuestion {
     pub explanation: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skill_codes: Vec<String>,
+    /// Tingkat kesukaran + Bloom C1-C6 (HOTS derived, never stored).
+    /// Optional so every question written before this existed still
+    /// loads — see quiz_taxonomy.rs for why the two axes stay separate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taxonomy: Option<crate::services::quiz_taxonomy::QuestionTaxonomy>,
 
     // Grammar-family
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -574,8 +579,26 @@ pub struct QuizConfig {
     // ── Presentation & policy ──
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passing_score: Option<f64>,
+    /// Shuffles the ORDER OF GROUPS within each section (and among
+    /// loose groups) — a different group order per learner. Does not
+    /// touch the order of questions inside a group, nor answer choices;
+    /// see `shuffle_question_order` and `shuffle_choices` for those.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shuffle_questions: Option<bool>,
+    /// Shuffles the order QUESTIONS are shown in within a group — only
+    /// for groups on the plain "flat" layout (one control per question);
+    /// a table/flow/passage-section layout's order is structural, not a
+    /// display choice, so this has no effect there. Phase 38 (Fase 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shuffle_question_order: Option<bool>,
+    /// Shuffles the DISPLAY order of each question's answer choices
+    /// (multiple_choice and its multi-select sibling) — a different
+    /// option order per learner, same correct answer. Safe because each
+    /// choice carries its own `label` (see `question-renderers`'
+    /// `optionLabel`): only the on-screen position moves, never the
+    /// letter that gets submitted and graded. Phase 38 (Fase 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shuffle_choices: Option<bool>,
     /// false = skip the "Mulai Kuis" guide page. Default true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub show_guide: Option<bool>,

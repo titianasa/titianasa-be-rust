@@ -484,6 +484,7 @@ pub async fn update_lesson_plan(
     ctx: &AuthContext,
     item_id: Uuid,
     raw: serde_json::Value,
+    ai_generated: bool,
 ) -> Result<crate::models::responses::module::LessonPlanSaveResponse, AppError> {
     can_edit_item(pool, ctx, item_id).await?;
     let item = find_by_id(pool, item_id).await?.ok_or(AppError::NotFound("module_item_not_found"))?;
@@ -501,6 +502,11 @@ pub async fn update_lesson_plan(
     parse_and_write_blocks(pool, item_id, &lesson_plan::to_alm(&plan), "markdown").await?;
     let value = serde_json::to_value(&plan).map_err(|e| AppError::Internal(e.into()))?;
     sqlx::query!(r#"update module_items set lesson_plan = $2, updated_at = now() where id = $1"#, item_id, value).execute(pool).await?;
+    // Only ever upgrades 'human' -> 'ai'; a later hand-edit of an
+    // AI-written plan does not erase the fact that a model wrote it.
+    if ai_generated {
+        sqlx::query!(r#"update module_items set generated_by = 'ai' where id = $1"#, item_id).execute(pool).await?;
+    }
 
     Ok(crate::models::responses::module::LessonPlanSaveResponse { id: item.id, status: item.status, qa_report: item.qa_report, lesson_plan: value })
 }
@@ -528,6 +534,19 @@ pub async fn submit_for_review(pool: &PgPool, ctx: &AuthContext, item_id: Uuid) 
         let typed: Vec<crate::services::curriculum_constitution::TypedBlock> =
             blocks.iter().map(|b| crate::services::curriculum_constitution::TypedBlock { r#type: b.r#type.clone(), data: b.data.clone() }).collect();
         crate::services::curriculum_constitution::validate_grammar_lesson(&typed)?;
+    }
+
+    // Fase 5d — a second hard gate, same "never let unreviewed AI
+    // content slip through unnoticed" reasoning as the grammar check
+    // above: a quiz with any group still marked `ai_meta.draft` is
+    // refused, not just flagged in the (non-blocking) QA report below.
+    if let Some(quiz_config) = &item.quiz_config {
+        if crate::services::quiz_config_schema::has_draft_groups(quiz_config) {
+            return Err(AppError::UnprocessableEntity(
+                "quiz_has_draft_groups",
+                "Masih ada grup soal berstatus draft AI — setujui atau hapus dulu sebelum diajukan.".to_string(),
+            ));
+        }
     }
 
     let qa_report = content_qa::run_item_qa(pool, item_id).await?;

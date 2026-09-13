@@ -13,5 +13,5 @@ pub async fn post_generate_fragment(
     Extension(ctx): Extension<AuthContext>,
     ValidatedJson(body): ValidatedJson<GenerateFragmentRequest>,
 ) -> Result<Json<GenerateFragmentResponse>, AppError> {
-    Ok(Json(alm_generation::generate_fragment(&state.db, state.ai_provider.as_ref(), &state.config.ai_lesson_generation_model, &ctx, body).await?))
+    Ok(Json(alm_generation::generate_fragment(&state.db, state.text_ai_provider.as_ref(), &state.config.ai_lesson_generation_model, &ctx, body).await?))
 }

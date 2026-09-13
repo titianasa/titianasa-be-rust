@@ -24,6 +24,14 @@ const PROVIDER: &str = "deepseek";
 const LESSON_GENERATION_PROMPT_ID: &str = "lesson_generation_v1";
 const QUESTION_GENERATION_PROMPT_ID: &str = "question_generation_v1";
 
+/// A full article for one chapter runs long — several explanation blocks
+/// (definition, example, common_trap, steps, comparison, ...) over one
+/// topic — and the old 2048 ceiling cut that off mid-article. This asks
+/// for the model's entire output budget instead; `resolve_max_tokens`
+/// still clamps it to whatever the chosen model actually allows, so a
+/// smaller model is not sent an impossible number.
+const ARTICLE_MAX_OUTPUT_TOKENS: i64 = 65_536;
+
 // --- Lesson generation ---
 
 pub struct LessonGenerationBlueprint {
@@ -229,52 +237,63 @@ pub async fn generate_lesson(pool: &PgPool, ctx: &AuthContext, ai: &dyn AIProvid
     };
 
     let (system_prompt, user_prompt) = lesson_generation_prompt(&bp, &subject_name);
-    let max_tokens = resolve_max_tokens(model, 2048).await;
+    let max_tokens = resolve_max_tokens(model, ARTICLE_MAX_OUTPUT_TOKENS).await;
     let request = GenerationRequest { model: model.to_string(), system_prompt, user_prompt, temperature: 0.4, max_tokens, image_url: None, json_mode: false };
 
     let ai_task_id = Uuid::new_v4();
 
-    let generation = match ai.generate(request).await {
-        Ok(g) => g,
-        Err(e) => {
-            tracing::warn!(error = ?e, %ai_task_id, "lesson generation provider call failed");
-            record_lesson_generation_failed(pool, ai_task_id, ctx.user_id, model).await;
-            return Err(AppError::AiOutputValidationFailed);
+    // One retry on the SAME provider across the whole generate-then-
+    // validate pipeline — a parse failure or a Grammar Constitution miss
+    // is just as often one-off model flakiness as a raw provider error,
+    // and none of this pipeline writes to the DB until it all passes.
+    // Never falls back to a different provider or model.
+    let mut outcome = None;
+    let mut last_error = String::new();
+    for attempt in 0..2 {
+        let generation = match ai.generate(request.clone()).await {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(error = ?e, %ai_task_id, attempt, "lesson generation provider call failed");
+                last_error = format!("Provider gagal: {e}");
+                continue;
+            }
+        };
+        let alm = strip_code_fence(&generation.text);
+        let parsed = match alm_parser::parse(&alm) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(%ai_task_id, attempt, raw_output = %alm, "AI-generated ALM failed to parse");
+                last_error = format!("{e}");
+                continue;
+            }
+        };
+        let new_blocks: Vec<NewContentBlock> =
+            parsed.iter().enumerate().map(|(i, b)| NewContentBlock { r#type: b.r#type.clone(), order_index: i as i32, data: b.data.clone(), raw_source: Some(b.raw_source.clone()) }).collect();
+        if let Err(e) = content_block::validate_blocks(pool, &new_blocks).await {
+            tracing::warn!(error = ?e, %ai_task_id, attempt, "AI-generated lesson failed block schema validation");
+            last_error = format!("{e}");
+            continue;
         }
-    };
-
-    let alm = strip_code_fence(&generation.text);
-
-    // Validate parse-ability, block schema, and — if applicable — the
-    // Grammar Constitution, all BEFORE any DB write, so a failed
-    // generation never leaves an orphan lessons row behind.
-    let parsed = match alm_parser::parse(&alm) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(%ai_task_id, raw_output = %alm, "AI-generated ALM failed to parse");
-            record_lesson_generation_failed(pool, ai_task_id, ctx.user_id, model).await;
-            return Err(e);
+        if let Some(typed_err) = bp.grammar_target.as_ref().and_then(|_| {
+            let typed: Vec<curriculum_constitution::TypedBlock> = parsed.iter().map(|b| curriculum_constitution::TypedBlock { r#type: b.r#type.clone(), data: b.data.clone() }).collect();
+            curriculum_constitution::validate_grammar_lesson(&typed).err()
+        }) {
+            tracing::warn!(error = ?typed_err, %ai_task_id, attempt, "AI-generated lesson failed Grammar Constitution");
+            last_error = format!("{typed_err}");
+            continue;
         }
-    };
-
-    let new_blocks: Vec<NewContentBlock> =
-        parsed.iter().enumerate().map(|(i, b)| NewContentBlock { r#type: b.r#type.clone(), order_index: i as i32, data: b.data.clone(), raw_source: Some(b.raw_source.clone()) }).collect();
-
-    if let Err(e) = content_block::validate_blocks(pool, &new_blocks).await {
-        tracing::warn!(error = ?e, %ai_task_id, "AI-generated lesson failed block schema validation");
+        outcome = Some((alm, generation));
+        break;
+    }
+    let Some((alm, generation)) = outcome else {
         record_lesson_generation_failed(pool, ai_task_id, ctx.user_id, model).await;
-        return Err(e);
-    }
+        return Err(AppError::AiOutputValidationFailed(Some(last_error)));
+    };
 
-    if bp.grammar_target.is_some() {
-        let typed: Vec<curriculum_constitution::TypedBlock> = parsed.iter().map(|b| curriculum_constitution::TypedBlock { r#type: b.r#type.clone(), data: b.data.clone() }).collect();
-        if let Err(e) = curriculum_constitution::validate_grammar_lesson(&typed) {
-            tracing::warn!(error = ?e, %ai_task_id, "AI-generated lesson failed Grammar Constitution");
-            record_lesson_generation_failed(pool, ai_task_id, ctx.user_id, model).await;
-            return Err(e);
-        }
-    }
-
+    // Writing into a bab's existing "Pembahasan" article — the usual
+    // path once a topic's structure is authored ahead of its content.
+    // update_content runs the same alm_parser/block_schema pipeline and
+    // enforces the same ADR-0008 published-immutable rule.
     // Everything above is a pure re-derivation of what module_item::create
     // will compute again internally (alm_parser/block_schema are pure
     // functions) — this call is expected to succeed given it just
@@ -389,40 +408,51 @@ pub async fn generate_questions(pool: &PgPool, ctx: &AuthContext, ai: &dyn AIPro
 
     let ai_task_id = Uuid::new_v4();
 
-    let generation = match ai.generate(request).await {
-        Ok(g) => g,
-        Err(e) => {
-            tracing::warn!(error = ?e, %ai_task_id, "question generation provider call failed");
+    // One retry on the SAME provider across generate + parse + schema
+    // validation — never falls back to a different provider or model.
+    // A count mismatch is NOT retried: that's the model ignoring an
+    // explicit instruction, not flakiness a second identical prompt
+    // reliably fixes, and it already carries its own descriptive error.
+    let mut outcome = None;
+    let mut last_error = String::new();
+    for attempt in 0..2 {
+        let generation = match ai.generate(request.clone()).await {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(error = ?e, %ai_task_id, attempt, "question generation provider call failed");
+                last_error = format!("Provider gagal: {e}");
+                continue;
+            }
+        };
+        let items: Vec<GeneratedQuestionItem> = match serde_json::from_str(&strip_code_fence(&generation.text)) {
+            Ok(items) => items,
+            Err(e) => {
+                tracing::warn!(%ai_task_id, attempt, raw_output = %generation.text, "AI-generated question output failed to parse as a JSON array");
+                last_error = format!("Model tidak mengembalikan JSON array yang valid: {e}");
+                continue;
+            }
+        };
+        if items.len() as i64 != bp.count {
+            tracing::warn!(%ai_task_id, attempt, expected = bp.count, got = items.len(), "AI-generated question count mismatch");
             record_question_generation_failed(pool, ai_task_id, ctx.user_id, model).await;
-            return Err(AppError::AiOutputValidationFailed);
+            return Err(AppError::UnprocessableEntity("invalid_ai_output_count", format!("expected {} question(s), got {}", bp.count, items.len())));
         }
-    };
-
-    let items: Vec<GeneratedQuestionItem> = match serde_json::from_str(&strip_code_fence(&generation.text)) {
-        Ok(items) => items,
-        Err(_) => {
-            tracing::warn!(%ai_task_id, raw_output = %generation.text, "AI-generated question output failed to parse as a JSON array");
-            record_question_generation_failed(pool, ai_task_id, ctx.user_id, model).await;
-            return Err(AppError::AiOutputValidationFailed);
+        // Validate every item against the schema registry BEFORE writing
+        // any of them — one bad item fails the whole batch, no partial
+        // set of questions ever gets created.
+        let invalid = items.iter().find_map(|item| question_schema::validate(&bp.question_type, &item.data, &item.correct_answer).err());
+        if let Some(e) = invalid {
+            tracing::warn!(error = ?e, %ai_task_id, attempt, "AI-generated question failed schema validation");
+            last_error = format!("{e}");
+            continue;
         }
-    };
-
-    if items.len() as i64 != bp.count {
-        tracing::warn!(%ai_task_id, expected = bp.count, got = items.len(), "AI-generated question count mismatch");
+        outcome = Some((items, generation));
+        break;
+    }
+    let Some((items, generation)) = outcome else {
         record_question_generation_failed(pool, ai_task_id, ctx.user_id, model).await;
-        return Err(AppError::UnprocessableEntity("invalid_ai_output_count", format!("expected {} question(s), got {}", bp.count, items.len())));
-    }
-
-    // Validate every item against the schema registry BEFORE writing any
-    // of them — one bad item fails the whole batch, no partial set of
-    // questions ever gets created.
-    for item in &items {
-        if let Err(e) = question_schema::validate(&bp.question_type, &item.data, &item.correct_answer) {
-            tracing::warn!(error = ?e, %ai_task_id, "AI-generated question failed schema validation");
-            record_question_generation_failed(pool, ai_task_id, ctx.user_id, model).await;
-            return Err(e);
-        }
-    }
+        return Err(AppError::AiOutputValidationFailed(Some(last_error)));
+    };
 
     let mut question_ids = Vec::with_capacity(items.len());
     for item in items {

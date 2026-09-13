@@ -721,7 +721,11 @@ const DISC_GROUPS: &[TemplateGroupSpec] = &[
 
 const CPNS_SKB_SECTIONS: &[TemplateSectionSpec] = &[sec("skb", "Seleksi Kompetensi Bidang", "Kompetensi teknis sesuai formasi jabatan yang dilamar.", 60.0)];
 const CPNS_SKB_GROUPS: &[TemplateGroupSpec] = &[
-    grp("skb", "multiple_choice", 80, "Pilih jawaban yang benar.", "Kompetensi teknis jabatan: regulasi, prosedur kerja, dan penerapan di lapangan."),
+    // Split across two groups — a single "Generate soal" call is capped
+    // at 50 questions (generate_quiz_group::MAX_COUNT), so 80 in one
+    // group could never actually be AI-generated at all.
+    grp("skb", "multiple_choice", 40, "Pilih jawaban yang benar.", "Kompetensi teknis jabatan: regulasi dan penerapan prosedur kerja."),
+    grp("skb", "multiple_choice", 40, "Pilih jawaban yang benar.", "Kompetensi teknis jabatan: studi kasus penerapan di lapangan."),
     grp("skb", "essay", 2, "Uraikan jawaban Anda.", "Studi kasus jabatan; dinilai rubrik."),
 ];
 
@@ -1222,6 +1226,28 @@ mod tests {
                     "template {} has a group pointing at missing section {}",
                     template.id,
                     group.section_ref
+                );
+            }
+        }
+    }
+
+    // Regression — cpns_skb authored one group with count=80. Every
+    // group's questions are filled by a single "Generate soal" call
+    // (generate_quiz_group), which refuses count > 50 outright — a
+    // group over that cap can never actually be AI-generated at all, a
+    // gap the QA sweep of every template (Phase 38) only caught by
+    // trying to apply and generate every one for real.
+    #[test]
+    fn no_group_asks_for_more_than_one_generate_call_can_produce() {
+        const MAX_GENERATABLE_COUNT: i64 = 50;
+        for template in TEMPLATES {
+            for group in template.groups {
+                assert!(
+                    group.count <= MAX_GENERATABLE_COUNT,
+                    "template {} group ({} x{}) exceeds generate_quiz_group's {MAX_GENERATABLE_COUNT}-question cap — split it across more groups",
+                    template.id,
+                    group.subtype,
+                    group.count,
                 );
             }
         }

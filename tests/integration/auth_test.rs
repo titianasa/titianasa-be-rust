@@ -55,6 +55,8 @@ fn test_config() -> Config {
         redis_url: "redis://127.0.0.1:6379".into(),
         collab_checkpoint_interval_seconds: 15,
         ai_live_chat_model: "~deepseek/deepseek-v4-flash-latest".into(),
+        gcp_project_id: "test-gcp-project".into(),
+        gcp_region: "us-central1".into(),
     }
 }
 
@@ -68,6 +70,7 @@ fn build_app(pool: PgPool) -> axum::Router {
         google_verifier: GoogleTokenVerifier::with_seeded_key(TEST_KID, key),
         payment_provider: std::sync::Arc::new(titian_backend_rust::services::payment_provider::StubQrisProvider),
         ai_provider: std::sync::Arc::new(titian_backend_rust::services::ai_provider::FakeAIProvider::success("{}")),
+        text_ai_provider: std::sync::Arc::new(titian_backend_rust::services::ai_provider::FakeAIProvider::success("{}")),
         meeting_provider: std::sync::Arc::new(titian_backend_rust::services::meeting_provider::StubMeetingProvider),
         storage: std::sync::Arc::new(titian_backend_rust::services::storage::InMemoryStorage::new()),
         canvas_hub: std::sync::Arc::new(titian_backend_rust::services::canvas_hub::CanvasHub::new()),

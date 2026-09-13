@@ -61,26 +61,37 @@ pub async fn evaluate(pool: &PgPool, config: &Config, ai: &dyn AIProvider, user_
     let ai_task_id = Uuid::new_v4();
 
     // Provider failure and schema-validation failure both surface as the
-    // same contract error (ai_output_validation_failed) — no separate
-    // code for a provider outage exists, and the user-facing effect (no
-    // usable result, no charge) is identical either way.
-    let generation = match ai.generate(request).await {
-        Ok(g) => g,
-        Err(e) => {
-            tracing::warn!(error = ?e, ai_task_id = %ai_task_id, "grammar evaluation provider call failed");
-            let _ = ai_task::insert_failed(pool, ai_task_id, user_id, "grammar_evaluation", PROVIDER, &model, GRAMMAR_EVALUATION_PROMPT_ID).await;
-            return Err(AppError::AiOutputValidationFailed);
+    // same contract error (ai_output_validation_failed), now carrying
+    // the real reason instead of a bare code. One retry on the SAME
+    // provider — never falls back to a different one — happens BEFORE
+    // any credit is charged (the charge below only runs once a usable
+    // result exists), so a retried call never risks a double charge.
+    let mut outcome = None;
+    let mut last_error = String::new();
+    for attempt in 0..2 {
+        let generation = match ai.generate(request.clone()).await {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(error = ?e, ai_task_id = %ai_task_id, attempt, "grammar evaluation provider call failed");
+                last_error = format!("Provider gagal: {e}");
+                continue;
+            }
+        };
+        let text = strip_code_fence(&generation.text);
+        match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(v) if v.get("errors").and_then(|e| e.as_array()).is_some() => {
+                outcome = Some((v, generation));
+                break;
+            }
+            _ => {
+                tracing::warn!(ai_task_id = %ai_task_id, attempt, raw_output = %generation.text, "grammar evaluation output failed schema validation");
+                last_error = "Model tidak mengembalikan daftar `errors` yang valid.".to_string();
+            }
         }
-    };
-
-    let text = strip_code_fence(&generation.text);
-    let result: serde_json::Value = match serde_json::from_str::<serde_json::Value>(&text) {
-        Ok(v) if v.get("errors").and_then(|e| e.as_array()).is_some() => v,
-        _ => {
-            tracing::warn!(ai_task_id = %ai_task_id, raw_output = %generation.text, "grammar evaluation output failed schema validation");
-            let _ = ai_task::insert_failed(pool, ai_task_id, user_id, "grammar_evaluation", PROVIDER, &model, GRAMMAR_EVALUATION_PROMPT_ID).await;
-            return Err(AppError::AiOutputValidationFailed);
-        }
+    }
+    let Some((result, generation)) = outcome else {
+        let _ = ai_task::insert_failed(pool, ai_task_id, user_id, "grammar_evaluation", PROVIDER, &model, GRAMMAR_EVALUATION_PROMPT_ID).await;
+        return Err(AppError::AiOutputValidationFailed(Some(last_error)));
     };
 
     ai_task::insert_done(pool, ai_task_id, user_id, "grammar_evaluation", PROVIDER, &model, GRAMMAR_EVALUATION_PROMPT_ID, generation.tokens_used.map(|t| t as i32)).await?;

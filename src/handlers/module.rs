@@ -153,7 +153,7 @@ pub async fn patch_lesson_plan(
     Path(id): Path<Uuid>,
     ValidatedJson(body): ValidatedJson<crate::models::requests::module::UpdateLessonPlanRequest>,
 ) -> Result<Json<crate::models::responses::module::LessonPlanSaveResponse>, AppError> {
-    Ok(Json(module_item::update_lesson_plan(&state.db, &ctx, id, body.lesson_plan).await?))
+    Ok(Json(module_item::update_lesson_plan(&state.db, &ctx, id, body.lesson_plan, body.ai_generated).await?))
 }
 
 // PATCH /module-items/{id}/subject — "ganti mapel item ini, tidak
@@ -421,6 +421,14 @@ pub async fn delete_item_share(State(state): State<Arc<AppState>>, Extension(ctx
 // the moment a subtype gained a field.
 pub async fn get_quiz_subtypes() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({ "items": crate::services::quiz_subtype::SUBTYPES }))
+}
+
+// GET /quiz-taxonomy — the difficulty/Bloom vocabulary, with both the
+// Indonesian and the English label for every level, so the Studio UI
+// and any future importer read the levels off one source of truth
+// instead of each hard-coding its own C1..C6 table.
+pub async fn get_quiz_taxonomy() -> axum::Json<crate::services::quiz_taxonomy::TaxonomyVocabulary> {
+    axum::Json(crate::services::quiz_taxonomy::vocabulary())
 }
 
 // GET /quiz-templates — the exam blueprint catalogue. Structure only:

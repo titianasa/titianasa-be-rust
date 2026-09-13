@@ -8,6 +8,10 @@
 // Voice (STT input / TTS output) is intentionally NOT ported yet — see
 // the phase-37 ticket. This is text in, text out.
 
+use std::sync::Arc;
+
+use axum::response::sse::Event;
+use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -145,33 +149,149 @@ pub async fn generate_turn(pool: &PgPool, ai: &dyn AIProvider, model: &str, ctx:
 
     let ai_task_id = Uuid::new_v4();
     let max_tokens = resolve_max_tokens(model, 900).await;
-    let generation = match ai
-        .generate(GenerationRequest {
-            model: model.to_string(),
-            system_prompt: system_prompt(&plan, section_index, language_label),
-            user_prompt: user_prompt(message, &req.history),
-            temperature: 0.7,
-            max_tokens,
-            image_url: None,
-            json_mode: false,
-        })
-        .await
-    {
-        Ok(g) => g,
-        Err(e) => {
-            tracing::warn!(error = ?e, item_id = %req.item_id, "live chat turn generation failed");
-            let _ = ai_task::insert_failed(pool, ai_task_id, ctx.user_id, "live_chat_turn", PROVIDER, model, PROMPT_ID).await;
-            return Err(AppError::AiOutputValidationFailed);
+    let request = GenerationRequest {
+        model: model.to_string(),
+        system_prompt: system_prompt(&plan, section_index, language_label),
+        user_prompt: user_prompt(message, &req.history),
+        temperature: 0.7,
+        max_tokens,
+        image_url: None,
+        json_mode: false,
+    };
+
+    // One retry on the SAME provider — a transient hiccup is worth one
+    // more try before the author sees a failure at all; never falls back
+    // to a different provider or model.
+    let mut outcome = None;
+    let mut last_error = String::new();
+    for attempt in 0..2 {
+        match ai.generate(request.clone()).await {
+            Ok(g) if !g.text.trim().is_empty() => {
+                outcome = Some(g);
+                break;
+            }
+            Ok(_) => {
+                tracing::warn!(%ai_task_id, attempt, item_id = %req.item_id, "live chat turn generation returned an empty reply");
+                last_error = "Model mengembalikan balasan kosong.".to_string();
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, %ai_task_id, attempt, item_id = %req.item_id, "live chat turn generation failed");
+                last_error = format!("Provider gagal: {e}");
+            }
         }
+    }
+    let Some(generation) = outcome else {
+        let _ = ai_task::insert_failed(pool, ai_task_id, ctx.user_id, "live_chat_turn", PROVIDER, model, PROMPT_ID).await;
+        return Err(AppError::AiOutputValidationFailed(Some(last_error)));
     };
 
     let reply = generation.text.trim();
-    if reply.is_empty() {
-        let _ = ai_task::insert_failed(pool, ai_task_id, ctx.user_id, "live_chat_turn", PROVIDER, model, PROMPT_ID).await;
-        return Err(AppError::AiOutputValidationFailed);
-    }
     ai_task::insert_done(pool, ai_task_id, ctx.user_id, "live_chat_turn", PROVIDER, model, PROMPT_ID, generation.tokens_used.map(|t| t as i32)).await?;
     Ok(ChatTurnResponse { reply: reply.to_string() })
+}
+
+/// The streaming twin of `generate_turn` — same validation, same prompt,
+/// but forwards each text delta to the client as it arrives instead of
+/// waiting for the whole reply. No retry: once even one chunk has
+/// reached the client there's no way to invisibly discard it and start
+/// over, so a mid-stream provider failure just ends the stream early
+/// (the learner keeps whatever partial reply already rendered) — only a
+/// failure to open the stream AT ALL is a normal request error, same
+/// shape as `generate_turn`'s.
+pub async fn generate_turn_stream(
+    pool: PgPool,
+    ai: Arc<dyn AIProvider>,
+    model: String,
+    ctx: AuthContext,
+    req: ChatTurnRequest,
+) -> Result<impl Stream<Item = Result<Event, std::convert::Infallible>>, AppError> {
+    let item = module_item::get_detail(&pool, &ctx, req.item_id).await?;
+    if item.content_type.as_deref() != Some("article") {
+        return Err(validation_error("not_an_article", "obrolan AI hanya tersedia untuk Modul Belajar"));
+    }
+
+    let message = req.message.trim().to_string();
+    if message.is_empty() {
+        return Err(validation_error("message_required", "pesan tidak boleh kosong"));
+    }
+    if message.chars().count() > MAX_MESSAGE_CHARS {
+        return Err(validation_error("message_too_long", format!("pesan maksimal {MAX_MESSAGE_CHARS} karakter")));
+    }
+
+    let language_label = language_name(&req.language).ok_or_else(|| validation_error("invalid_language", "bahasa tidak dikenal"))?;
+    let plan = lesson_plan::parse(&req.lesson_plan)?;
+    if plan.sections.is_empty() {
+        return Err(validation_error("empty_plan", "modul ini belum punya bagian untuk didiskusikan"));
+    }
+    let section_index = req.section_index.min(plan.sections.len() - 1);
+
+    let ai_task_id = Uuid::new_v4();
+    let max_tokens = resolve_max_tokens(&model, 900).await;
+    let request = GenerationRequest {
+        model: model.clone(),
+        system_prompt: system_prompt(&plan, section_index, language_label),
+        user_prompt: user_prompt(&message, &req.history),
+        temperature: 0.7,
+        max_tokens,
+        image_url: None,
+        json_mode: false,
+    };
+
+    let inner = ai.generate_stream(request).await.map_err(|e| {
+        tracing::warn!(error = ?e, %ai_task_id, item_id = %req.item_id, "live chat turn stream failed to open");
+        AppError::AiOutputValidationFailed(Some(format!("Provider gagal: {e}")))
+    })?;
+
+    struct State {
+        inner: crate::services::ai_provider::TextChunkStream,
+        pool: PgPool,
+        user_id: Uuid,
+        item_id: Uuid,
+        ai_task_id: Uuid,
+        model: String,
+        accumulated: String,
+        done: bool,
+    }
+    let state = State { inner, pool, user_id: ctx.user_id, item_id: req.item_id, ai_task_id, model, accumulated: String::new(), done: false };
+
+    let stream = futures_util::stream::unfold(state, |mut st| async move {
+        if st.done {
+            return None;
+        }
+        match st.inner.next().await {
+            Some(Ok(chunk)) => {
+                st.accumulated.push_str(&chunk);
+                Some((Ok(Event::default().event("chunk").data(chunk)), st))
+            }
+            Some(Err(e)) => {
+                let ai_task_id = st.ai_task_id;
+                let item_id = st.item_id;
+                tracing::warn!(error = ?e, %ai_task_id, %item_id, "live chat turn stream failed mid-reply");
+                st.done = true;
+                let reply = st.accumulated.trim();
+                if reply.is_empty() {
+                    let _ = ai_task::insert_failed(&st.pool, st.ai_task_id, st.user_id, "live_chat_turn", PROVIDER, &st.model, PROMPT_ID).await;
+                } else {
+                    // A real (if truncated) reply already reached the
+                    // learner — that's a done turn, not a failed one.
+                    let _ = ai_task::insert_done(&st.pool, st.ai_task_id, st.user_id, "live_chat_turn", PROVIDER, &st.model, PROMPT_ID, None).await;
+                }
+                Some((Ok(Event::default().event("error").data(e.0.clone())), st))
+            }
+            None => {
+                st.done = true;
+                let reply = st.accumulated.trim().to_string();
+                if reply.is_empty() {
+                    let _ = ai_task::insert_failed(&st.pool, st.ai_task_id, st.user_id, "live_chat_turn", PROVIDER, &st.model, PROMPT_ID).await;
+                    return Some((Ok(Event::default().event("error").data("Model mengembalikan balasan kosong.")), st));
+                }
+                let _ = ai_task::insert_done(&st.pool, st.ai_task_id, st.user_id, "live_chat_turn", PROVIDER, &st.model, PROMPT_ID, None).await;
+                Some((Ok(Event::default().event("done").data("")), st))
+            }
+        }
+    });
+
+    Ok(stream)
 }
 
 #[cfg(test)]

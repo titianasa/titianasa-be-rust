@@ -24,6 +24,7 @@ pub fn protected_routes() -> Router<Arc<AppState>> {
         .route("/quiz-subtypes", get(handlers::module::get_quiz_subtypes))
 
         // Exam blueprints — list, and apply one into a fresh quiz_config.
+        .route("/quiz-taxonomy", get(handlers::module::get_quiz_taxonomy))
         .route("/quiz-templates", get(handlers::module::get_quiz_templates))
         .route("/quiz-templates/{id}", get(handlers::module::get_quiz_template))
         .route("/quiz-templates/{id}/apply", post(handlers::module::post_apply_quiz_template))

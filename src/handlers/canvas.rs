@@ -100,6 +100,6 @@ pub async fn post_submit(
     Extension(ctx): Extension<AuthContext>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<crate::services::ai_writing_evaluation::WritingSubmitResponse>, AppError> {
-    let result = canvas::submit_session(&state.db, &ctx, state.ai_provider.as_ref(), &state.config.ai_writing_evaluation_model, id).await?;
+    let result = canvas::submit_session(&state.db, &ctx, state.text_ai_provider.as_ref(), &state.config.ai_writing_evaluation_model, id).await?;
     Ok(Json(result))
 }

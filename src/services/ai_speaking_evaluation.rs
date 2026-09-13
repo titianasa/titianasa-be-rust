@@ -104,13 +104,28 @@ pub struct SpeakingEvaluationResult {
 // AiRubric-mode quiz subtype backed by audio (voice_record,
 // speaking_challenge, listen_repeat), not just the item-level
 // `speaking` submit path below.
-pub async fn run_speaking_evaluation(pool: &PgPool, config: &Config, ai: &dyn AIProvider, user_id: Uuid, attempt_id: Uuid, audio_bytes: &[u8], audio_content_type: &str, question_id: Option<Uuid>) -> SpeakingEvaluationResult {
+// GCP migration — this is the one AiRubric grader that needs TWO
+// providers: `stt_ai` transcribes the recording (stays on OpenRouter;
+// Vertex's Gemini text provider doesn't implement transcribe at all),
+// `text_ai` then evaluates the transcript (Vertex AI Gemini).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_speaking_evaluation(
+    pool: &PgPool,
+    config: &Config,
+    stt_ai: &dyn AIProvider,
+    text_ai: &dyn AIProvider,
+    user_id: Uuid,
+    attempt_id: Uuid,
+    audio_bytes: &[u8],
+    audio_content_type: &str,
+    question_id: Option<Uuid>,
+) -> SpeakingEvaluationResult {
     let ai_task_id = Uuid::new_v4();
     let Ok(rubric) = ensure_speaking_rubric(pool).await else {
         return SpeakingEvaluationResult { transcript: None, evaluation: None };
     };
 
-    let transcript = match ai.transcribe(audio_bytes, audio_content_type, &config.ai_stt_model).await {
+    let transcript = match stt_ai.transcribe(audio_bytes, audio_content_type, &config.ai_stt_model).await {
         Ok(t) => t.text,
         Err(e) => {
             tracing::warn!(error = ?e, "speaking evaluation transcription failed");
@@ -122,7 +137,7 @@ pub async fn run_speaking_evaluation(pool: &PgPool, config: &Config, ai: &dyn AI
     let (system_prompt, user_prompt) = speaking_evaluation_prompt(&transcript);
     let model = &config.ai_speaking_evaluation_model;
     let max_tokens = resolve_max_tokens(model, 1024).await;
-    let generation = match ai.generate(GenerationRequest { model: model.clone(), system_prompt, user_prompt, temperature: 0.3, max_tokens, image_url: None, json_mode: true }).await {
+    let generation = match text_ai.generate(GenerationRequest { model: model.clone(), system_prompt, user_prompt, temperature: 0.3, max_tokens, image_url: None, json_mode: true }).await {
         Ok(g) => g,
         Err(e) => {
             tracing::warn!(error = ?e, "speaking evaluation generation failed");

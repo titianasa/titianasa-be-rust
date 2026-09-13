@@ -33,14 +33,14 @@ pub async fn post_turn(State(state): State<Arc<AppState>>, Extension(_ctx): Exte
         mode: body.mode,
         language: body.language,
     };
-    let result = speaking_room::generate_turn(state.ai_provider.as_ref(), &state.config.ai_speaking_room_text_model, req).await?;
+    let result = speaking_room::generate_turn(state.text_ai_provider.as_ref(), &state.config.ai_speaking_room_text_model, req).await?;
     Ok(Json(result))
 }
 
 // POST /speaking-room/summary
 pub async fn post_summary(State(state): State<Arc<AppState>>, Extension(_ctx): Extension<AuthContext>, ValidatedJson(body): ValidatedJson<PostSummaryRequest>) -> Result<Json<serde_json::Value>, AppError> {
     let req = SessionSummaryRequest { messages: body.messages, scenario: body.scenario, level: body.level, language: body.language };
-    let result = speaking_room::generate_session_summary(state.ai_provider.as_ref(), &state.config.ai_speaking_room_text_model, req).await?;
+    let result = speaking_room::generate_session_summary(state.text_ai_provider.as_ref(), &state.config.ai_speaking_room_text_model, req).await?;
     Ok(Json(result))
 }
 

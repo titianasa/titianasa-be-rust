@@ -15,7 +15,20 @@
 
 use std::collections::HashSet;
 
-use crate::services::quiz_config::LabeledOption;
+use crate::services::quiz_config::{value_to_key, LabeledOption};
+
+/// A quantitative "isian singkat" answer very often comes back as a
+/// JSON *number*, not a string — `Value::as_str()` returns `None` for
+/// that, so any caller using it directly silently treated a numeric
+/// answer as absent. This is the one conversion every scalar extraction
+/// here goes through instead.
+fn value_text(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(_) => Some(value_to_key(v)),
+        _ => None,
+    }
+}
 
 /// Bidirectional numeral/number-word aliases. Only kick in when the text
 /// actually contains one side of a pair, so "one-off" doesn't become
@@ -157,9 +170,11 @@ pub fn expand_answer_key(correct: Option<&serde_json::Value>) -> HashSet<String>
     let Some(correct) = correct else { return out };
 
     let raw_items: Vec<String> = match correct {
-        serde_json::Value::Array(items) => items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
-        serde_json::Value::String(s) => vec![s.clone()],
-        _ => return out,
+        serde_json::Value::Array(items) => items.iter().filter_map(value_text).collect(),
+        other => match value_text(other) {
+            Some(s) => vec![s],
+            None => return out,
+        },
     };
 
     for raw in raw_items {
@@ -256,9 +271,12 @@ pub fn matches_reorder(user: &str, correct: Option<&serde_json::Value>) -> bool 
     }
 
     let raw_keys: Vec<String> = match correct {
-        Some(serde_json::Value::Array(items)) => items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
-        Some(serde_json::Value::String(s)) => vec![s.clone()],
-        _ => return false,
+        Some(serde_json::Value::Array(items)) => items.iter().filter_map(value_text).collect(),
+        Some(other) => match value_text(other) {
+            Some(s) => vec![s],
+            None => return false,
+        },
+        None => return false,
     };
 
     raw_keys.iter().flat_map(|k| k.split('|')).any(|k| strip(k) == stripped_user)
@@ -372,9 +390,9 @@ pub fn matches_answer_with_options(user: &str, correct: Option<&serde_json::Valu
     }
 
     let key_candidates: Vec<String> = match correct {
-        Some(serde_json::Value::Array(items)) => items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
-        Some(serde_json::Value::String(s)) => vec![s.clone()],
-        _ => Vec::new(),
+        Some(serde_json::Value::Array(items)) => items.iter().filter_map(value_text).collect(),
+        Some(other) => value_text(other).into_iter().collect(),
+        None => Vec::new(),
     };
     key_candidates.iter().any(|k| match strip_loose_label_prefix(k) {
         Some(rest) => matches_answer(&bare_text, Some(&serde_json::Value::String(rest))),
@@ -498,6 +516,19 @@ mod tests {
         assert!(matches_answer("1,000", Some(&k3)));
         // Still wrong when the value differs.
         assert!(!matches_answer("1,6", Some(&k)));
+    }
+
+    // Regression — the QA sweep found "isian singkat" numeric answers
+    // failing near-universally: the model authors the key as a bare
+    // JSON number, and `expand_answer_key`'s array/string-only match
+    // silently discarded it (returning an empty key set) before any
+    // comparison ran.
+    #[test]
+    fn a_bare_json_number_key_is_not_silently_discarded() {
+        let k = key(json!(42));
+        assert!(matches_answer("42", Some(&k)));
+        let k2 = key(json!(1.5));
+        assert!(matches_answer("1,5", Some(&k2)));
     }
 
     #[test]

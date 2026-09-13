@@ -82,6 +82,13 @@ pub struct UpdateQuizConfigRequest {
 #[derive(Debug, serde::Deserialize)]
 pub struct UpdateLessonPlanRequest {
     pub lesson_plan: serde_json::Value,
+    /// The plan being saved came straight out of `/ai/generate-lesson-plan`.
+    /// Generation does not persist (the author reviews first), so this
+    /// save is the only moment provenance can be recorded — without it
+    /// every AI-written Modul Belajar is filed as hand-written, and the
+    /// ✨ marker in the item tree lies about who wrote the material.
+    #[serde(default)]
+    pub ai_generated: bool,
 }
 
 // PATCH /module-items/{id}/guards — both always sent; null clears.

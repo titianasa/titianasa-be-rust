@@ -225,6 +225,17 @@ pub fn parse_generated_plan(text: &str) -> LessonPlan {
     }
 }
 
+/// Every section the model opened, it also closed. `parse_generated_plan`
+/// is deliberately lenient about a missing `<<<END_SECTION>>>` (an
+/// author's hand-pasted text shouldn't be rejected for it), which is
+/// exactly what let a reply cut off mid-sentence through as a complete
+/// one-section module. Generation holds the stricter bar: a cut-off
+/// reply is retried, never saved.
+fn plan_reply_is_complete(text: &str) -> bool {
+    let opened = text.matches(SECTION_OPEN).count();
+    opened > 0 && opened == text.matches(SECTION_CLOSE).count() && text.rfind(SECTION_CLOSE) > text.rfind(SECTION_OPEN)
+}
+
 /// META + CONTENT, the shape every single-section call returns. With
 /// no delimiters at all the whole reply is taken as the body — the
 /// same fallback parelabs uses, since a model that ignored the protocol
@@ -385,7 +396,11 @@ pub async fn generate_plan(pool: &PgPool, ai: &dyn AIProvider, model: &str, ctx:
 
     let (system_prompt, user_prompt) = generation_prompt(&req, item.subject.as_deref(), language);
     let ai_task_id = Uuid::new_v4();
-    let max_tokens = resolve_max_tokens(model, 32_000).await;
+    // A sectioned Modul Belajar for one bab is the longest single
+    // generation this platform makes — several sections, each with its
+    // own explanation blocks. Ask for the model's whole budget;
+    // resolve_max_tokens still clamps it to what the model allows.
+    let max_tokens = resolve_max_tokens(model, 65_536).await;
     let request = GenerationRequest { model: model.to_string(), system_prompt, user_prompt, temperature: 0.5, max_tokens, image_url: None, json_mode: false };
 
     // One retry — a transient provider failure or a reply with no
@@ -393,17 +408,25 @@ pub async fn generate_plan(pool: &PgPool, ai: &dyn AIProvider, model: &str, ctx:
     // reason to make the author wait a full minute for nothing and
     // click "Buat Modul" again themselves.
     let mut outcome = None;
+    let mut last_error = String::new();
     for attempt in 0..2 {
         let generation = match ai.generate(request.clone()).await {
             Ok(g) => g,
             Err(e) => {
                 tracing::warn!(error = ?e, %ai_task_id, attempt, "lesson plan generation provider call failed");
+                last_error = format!("Provider gagal: {e}");
                 continue;
             }
         };
+        if !plan_reply_is_complete(&generation.text) {
+            tracing::warn!(%ai_task_id, attempt, raw_len = generation.text.len(), "lesson plan generation reply was cut off before its last section closed");
+            last_error = "Balasan model terpotong sebelum modul selesai.".to_string();
+            continue;
+        }
         let plan = parse_generated_plan(&generation.text);
         if plan.sections.is_empty() {
             tracing::warn!(%ai_task_id, attempt, raw_output = %generation.text, "lesson plan generation returned no sections");
+            last_error = "Model tidak mengembalikan bagian modul apa pun.".to_string();
             continue;
         }
         outcome = Some((plan, generation));
@@ -412,7 +435,7 @@ pub async fn generate_plan(pool: &PgPool, ai: &dyn AIProvider, model: &str, ctx:
     let Some((mut plan, generation)) = outcome else {
         tracing::warn!(%ai_task_id, "lesson plan generation failed after retry");
         record_failed(pool, ai_task_id, ctx.user_id, "lesson_plan_generation", model, GENERATE_PROMPT_ID).await;
-        return Err(AppError::AiOutputValidationFailed);
+        return Err(AppError::AiOutputValidationFailed(Some(last_error)));
     };
     // The author's explicit pick wins over whatever the model echoed.
     plan.language = req.language.clone();
@@ -610,20 +633,24 @@ Daftar bagian dalam modul ini:\n",
     // hiccup or an unparseable/invalid reply is usually a one-off, and
     // retrying is cheaper than making the author re-click "Edit dengan AI".
     let mut outcome = None;
+    let mut last_error = String::new();
     for attempt in 0..2 {
         let generation = match ai.generate(request.clone()).await {
             Ok(g) => g,
             Err(e) => {
                 tracing::warn!(error = ?e, %ai_task_id, attempt, "lesson section edit provider call failed");
+                last_error = format!("Provider gagal: {e}");
                 continue;
             }
         };
         let Some(updated) = parse_section_reply(&generation.text, &section) else {
             tracing::warn!(%ai_task_id, attempt, raw_output = %generation.text, "lesson section edit output unusable");
+            last_error = "Balasan model tidak bisa dipakai sebagai bagian modul.".to_string();
             continue;
         };
-        if lesson_plan::validate_content(&updated.content).is_err() {
+        if let Err(e) = lesson_plan::validate_content(&updated.content) {
             tracing::warn!(%ai_task_id, attempt, raw_output = %generation.text, "lesson section edit produced invalid content");
+            last_error = format!("Isi hasil edit tidak valid: {e}");
             continue;
         }
         outcome = Some((updated, generation));
@@ -632,7 +659,7 @@ Daftar bagian dalam modul ini:\n",
     let Some((updated, generation)) = outcome else {
         tracing::warn!(%ai_task_id, "lesson section edit failed after retry");
         record_failed(pool, ai_task_id, ctx.user_id, "lesson_section_edit", model, EDIT_PROMPT_ID).await;
-        return Err(AppError::AiOutputValidationFailed);
+        return Err(AppError::AiOutputValidationFailed(Some(last_error)));
     };
 
     ai_task::insert_done(pool, ai_task_id, ctx.user_id, "lesson_section_edit", PROVIDER, model, EDIT_PROMPT_ID, generation.tokens_used.map(|t| t as i32)).await?;
@@ -753,7 +780,9 @@ pub async fn translate_plan(pool: &PgPool, ai: &dyn AIProvider, model: &str, ctx
 
     if !plan.sections.is_empty() && failures == plan.sections.len() {
         record_failed(pool, ai_task_id, ctx.user_id, "lesson_plan_translation", model, TRANSLATE_PROMPT_ID).await;
-        return Err(AppError::AiOutputValidationFailed);
+        return Err(AppError::AiOutputValidationFailed(Some(format!(
+            "Semua {failures} bagian gagal diterjemahkan (provider gagal atau balasan tidak terpakai pada tiap percobaan)."
+        ))));
     }
 
     let (title, topic) = header.unwrap_or_default();
@@ -825,5 +854,23 @@ mod tests {
             assert!(language_name(code).is_some());
         }
         assert!(language_name("xx").is_none());
+    }
+
+    #[test]
+    fn a_reply_cut_off_inside_its_last_section_is_not_complete() {
+        // The real failure: a module that stopped mid-sentence in its
+        // first section, which the lenient parser happily returned as a
+        // finished one-section plan.
+        let cut = "<<<PLAN>>>{\"title\": \"Lawan Bilangan\"}<<<END_PLAN>>>\n<<<SECTION>>>\n<<<META>>>{\"title\": \"Garis Bilangan\"}<<<END_META>>>\n<<<CONTENT>>>\nBilangan nol adalah titik acuan di sebelah kanan dan";
+        assert!(!plan_reply_is_complete(cut));
+        assert_eq!(parse_generated_plan(cut).sections.len(), 1, "the parser alone would have accepted it");
+
+        let whole = format!("{cut}\n<<<END_CONTENT>>>\n<<<END_SECTION>>>");
+        assert!(plan_reply_is_complete(&whole));
+
+        // Closed first section, second one cut off.
+        let second_cut = format!("{whole}\n<<<SECTION>>>\n<<<META>>>{{}}<<<END_META>>>\n<<<CONTENT>>>\nsetengah");
+        assert!(!plan_reply_is_complete(&second_cut));
+        assert!(!plan_reply_is_complete("no delimiters at all"));
     }
 }

@@ -14,6 +14,9 @@ pub fn protected_routes() -> Router<Arc<AppState>> {
         .route("/ai/ocr-to-question", post(handlers::ai::post_ocr_to_question))
         .route("/ai/transcribe-audio", post(handlers::ai::post_transcribe_audio))
         .route("/ai/generate-quiz-group", post(handlers::ai::post_generate_quiz_group))
+        .route("/ai/quiz/generate-batch", post(handlers::ai::post_generate_quiz_batch))
+        .route("/ai/quiz/convert-group-type", post(handlers::ai::post_convert_group_type))
+        .route("/ai/quiz/suggest-group-types", post(handlers::ai::post_suggest_group_types))
         .route("/ai/generate-lesson-plan", post(handlers::lesson_plan::post_generate_lesson_plan))
         .route("/ai/edit-lesson-section", post(handlers::lesson_plan::post_edit_lesson_section))
         .route("/ai/translate-lesson-plan", post(handlers::lesson_plan::post_translate_lesson_plan))
@@ -23,5 +26,6 @@ pub fn protected_routes() -> Router<Arc<AppState>> {
             post(handlers::document::post_extract_document).layer(axum::extract::DefaultBodyLimit::max(12 * 1024 * 1024)),
         )
         .route("/ai/live-chat-turn", post(handlers::live_chat::post_live_chat_turn))
+        .route("/ai/live-chat-turn/stream", post(handlers::live_chat::post_live_chat_turn_stream))
         .route("/ai/generate-alm-fragment", post(handlers::alm_generation::post_generate_fragment))
 }

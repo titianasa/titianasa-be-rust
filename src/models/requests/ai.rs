@@ -64,16 +64,62 @@ pub struct GenerateQuizGroupRequest {
     #[serde(default)]
     pub reference_module_item_ids: Vec<Uuid>,
     pub asset_id: Option<Uuid>,
+    /// "Tempel & Parse" — pasted text to extract questions from instead
+    /// of inventing new ones. Ignored when `asset_id` is set.
+    pub raw_text: Option<String>,
     /// Overrides the server's default text model — must be one of
     /// `GET /ai/models`'s ids, or the request is rejected outright
     /// (422 `model_not_allowed`). Ignored when `asset_id` is set: an
     /// image source always needs the vision-capable OCR model, not
     /// whatever text model the author picked.
     pub model: Option<String>,
+    /// Fase 5d — stamp the written group `ai_meta.draft = true`. Set by
+    /// a caller materializing groups the author hasn't looked at yet
+    /// (the document-import dialog's per-block/flat fill); the
+    /// interactive "Generate soal" dialog leaves this false, since the
+    /// author is looking straight at the result.
+    #[serde(default)]
+    pub mark_draft: bool,
 }
 
 fn default_count() -> i64 {
     1
+}
+
+/// POST /ai/quiz/generate-batch — fills every still-empty question
+/// group in the item, one call per group, up to 3 at a time.
+#[derive(Debug, serde::Deserialize)]
+pub struct GenerateQuizBatchRequest {
+    pub item_id: Uuid,
+    /// Questions per group. Applied uniformly — the batch has no way to
+    /// know a subtype-appropriate count per group ahead of time, so the
+    /// author picks one number for the whole run.
+    #[serde(default = "default_batch_count")]
+    pub count: i64,
+    pub model: Option<String>,
+}
+
+fn default_batch_count() -> i64 {
+    5
+}
+
+/// POST /ai/quiz/convert-group-type — reshape a group into a different
+/// subtype, preserving its content.
+#[derive(Debug, serde::Deserialize)]
+pub struct ConvertGroupTypeRequest {
+    pub item_id: Uuid,
+    pub group_id: String,
+    pub new_subtype: String,
+    pub model: Option<String>,
+}
+
+/// POST /ai/quiz/suggest-group-types — a document's text in, a proposed
+/// section + block manifest out (no `item_id`: this doesn't touch any
+/// stored quiz_config, the author applies the manifest afterward).
+#[derive(Debug, serde::Deserialize)]
+pub struct SuggestGroupTypesRequest {
+    pub document_text: String,
+    pub model: Option<String>,
 }
 
 /// POST /ai/generate-lesson-plan — the "Buat Otomatis dengan AI" panel.

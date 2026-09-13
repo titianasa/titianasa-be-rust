@@ -104,22 +104,38 @@ pub async fn ocr_to_question(pool: &PgPool, config: &Config, ctx: &AuthContext, 
 
     let ai_task_id = Uuid::new_v4();
 
-    let generation = match ai.generate(request).await {
-        Ok(g) => g,
-        Err(e) => {
-            tracing::warn!(error = ?e, %ai_task_id, "OCR provider call failed");
-            record_ocr_failed(pool, ai_task_id, ctx.user_id, model).await;
-            return Err(AppError::AiOutputValidationFailed);
+    // One retry on the SAME provider — never falls back to a different
+    // one — for either a raw provider failure or output that doesn't
+    // parse as a non-empty JSON array.
+    let mut outcome = None;
+    let mut last_error = String::new();
+    for attempt in 0..2 {
+        let generation = match ai.generate(request.clone()).await {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(error = ?e, %ai_task_id, attempt, "OCR provider call failed");
+                last_error = format!("Provider gagal: {e}");
+                continue;
+            }
+        };
+        match serde_json::from_str::<Vec<OcrItem>>(&strip_code_fence(&generation.text)) {
+            Ok(items) if !items.is_empty() => {
+                outcome = Some((items, generation));
+                break;
+            }
+            Ok(_) => {
+                tracing::warn!(%ai_task_id, attempt, raw_output = %generation.text, "AI-generated OCR output was an empty array");
+                last_error = "Model tidak menemukan soal apa pun di gambar ini.".to_string();
+            }
+            Err(e) => {
+                tracing::warn!(%ai_task_id, attempt, raw_output = %generation.text, "AI-generated OCR output failed to parse as a JSON array");
+                last_error = format!("Model tidak mengembalikan JSON array yang valid: {e}");
+            }
         }
-    };
-
-    let items: Vec<OcrItem> = match serde_json::from_str::<Vec<OcrItem>>(&strip_code_fence(&generation.text)) {
-        Ok(items) if !items.is_empty() => items,
-        _ => {
-            tracing::warn!(%ai_task_id, raw_output = %generation.text, "AI-generated OCR output failed to parse as a non-empty JSON array");
-            record_ocr_failed(pool, ai_task_id, ctx.user_id, model).await;
-            return Err(AppError::AiOutputValidationFailed);
-        }
+    }
+    let Some((items, generation)) = outcome else {
+        record_ocr_failed(pool, ai_task_id, ctx.user_id, model).await;
+        return Err(AppError::AiOutputValidationFailed(Some(last_error)));
     };
 
     // Every item lands as a draft question, confidently classified or

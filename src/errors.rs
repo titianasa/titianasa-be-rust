@@ -57,11 +57,15 @@ pub enum AppError {
     // when an uploaded file exceeds config.asset_max_bytes.
     #[error("payload_too_large")]
     PayloadTooLarge(&'static str),
-    // Port of error.ts's aiOutputValidationFailed — 422, a dedicated
-    // factory (not the generic UnprocessableEntity(code, detail)) since
-    // its detail is always null, never a message.
+    // Port of error.ts's aiOutputValidationFailed — 422. Originally a
+    // dedicated no-detail factory; now carries the real underlying
+    // reason (the provider's own error, or why the output couldn't be
+    // used) so a failure reads as something other than a bare error
+    // code — the retry loop already tried again on the SAME provider
+    // before giving up (never falls back to a different provider), so
+    // this is the one message the caller actually gets to see.
     #[error("unprocessable_entity")]
-    AiOutputValidationFailed,
+    AiOutputValidationFailed(Option<String>),
     #[error("database error")]
     Database(#[from] sqlx::Error),
     #[error("internal error")]
@@ -113,7 +117,7 @@ impl IntoResponse for AppError {
             }
             AppError::BadGateway(code, detail) => (StatusCode::BAD_GATEWAY, json!({"error": code, "detail": detail})),
             AppError::PayloadTooLarge(code) => (StatusCode::PAYLOAD_TOO_LARGE, json!({"error": code, "detail": null})),
-            AppError::AiOutputValidationFailed => (StatusCode::UNPROCESSABLE_ENTITY, json!({"error": "ai_output_validation_failed", "detail": null})),
+            AppError::AiOutputValidationFailed(detail) => (StatusCode::UNPROCESSABLE_ENTITY, json!({"error": "ai_output_validation_failed", "detail": detail})),
             // A unique-key clash is the CALLER re-sending a value that
             // already exists (e.g. modules.code), not a server fault —
             // it used to surface as an opaque 500 internal_error, which

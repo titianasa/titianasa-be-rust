@@ -28,7 +28,7 @@ rand = { version = "0.8", features = ["getrandom"] }
 base64 = "0.22"
 
 # HTTP client (Google JWKS fetch; OpenRouter chat/STT/TTS; Google Meet API)
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "multipart"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "multipart", "stream"], default-features = false }
 
 # Utils
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -72,6 +72,8 @@ futures-util = "0.3"
 pdf-extract = "0.7"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
 quick-xml = "0.31"
+gcp_auth = "0.12.7"
+bytes = "1.12.1"
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }
@@ -87,5 +89,17 @@ http-body-util = "0.1"
 [profile.dev]
 debug = "line-tables-only"
 
+# Every integration test in tests/ links its own full copy of this crate
+# plus every dependency (~190 MB each, ~40 of them). Line tables for
+# third-party crates are most of that weight and are almost never read —
+# a backtrace into tokio or sqlx internals is not where our bugs are.
+# Our own crate keeps its line tables (set above), so panics still point
+# at the right line in src/.
+[profile.dev.package."*"]
+debug = false
+
 [profile.test]
 debug = "line-tables-only"
+
+[profile.test.package."*"]
+debug = false

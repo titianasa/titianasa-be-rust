@@ -1,7 +1,8 @@
-// Phase 38 (Fase 1) — "Maks. Percobaan": a learner may only START a
-// quiz `quiz_config.max_attempts` times. No prior integration test
-// exercised the Phase 37 quiz-config/attempt flow over real HTTP at
-// all (only --lib unit tests), so this also doubles as the first one.
+// Phase 38 (Fase 5b) — POST /ai/quiz/convert-group-type reshapes a
+// group into a different subtype instead of inventing fresh material —
+// the group's existing question content is folded into the prompt as
+// "preserve this, just change the format", and the merge writes the new
+// subtype id onto the group alongside the regenerated questions.
 
 use axum::{
     body::Body,
@@ -64,8 +65,23 @@ fn test_config() -> Config {
         redis_url: "redis://127.0.0.1:6379".into(),
         collab_checkpoint_interval_seconds: 15,
         ai_live_chat_model: "test-model".into(),
+        gcp_project_id: "test-gcp-project".into(),
+        gcp_region: "us-central1".into(),
     }
 }
+
+// A true_false-shaped reply — what the group looks like AFTER
+// conversion from multiple_choice.
+const VALID_TF_REPLY: &str = r#"{
+  "questions": [
+    {
+      "number": 1,
+      "text": "Jakarta adalah ibu kota Indonesia.",
+      "answer": "True",
+      "explanation": "Jakarta adalah ibu kota Indonesia sejak 1945."
+    }
+  ]
+}"#;
 
 fn build_app(pool: PgPool) -> axum::Router {
     let state = Arc::new(AppState {
@@ -74,7 +90,8 @@ fn build_app(pool: PgPool) -> axum::Router {
         config: test_config(),
         google_verifier: titian_backend_rust::services::google_oauth::GoogleTokenVerifier::new(),
         payment_provider: Arc::new(titian_backend_rust::services::payment_provider::StubQrisProvider),
-        ai_provider: Arc::new(FakeAIProvider::success("{}")),
+        ai_provider: Arc::new(FakeAIProvider::success(VALID_TF_REPLY)),
+        text_ai_provider: Arc::new(FakeAIProvider::success(VALID_TF_REPLY)),
         meeting_provider: Arc::new(titian_backend_rust::services::meeting_provider::StubMeetingProvider),
         storage: Arc::new(titian_backend_rust::services::storage::InMemoryStorage::new()),
         canvas_hub: Arc::new(titian_backend_rust::services::canvas_hub::CanvasHub::new()),
@@ -119,86 +136,73 @@ async fn send(app: axum::Router, method: Method, uri: &str, token: &str, body: V
     (status, body_json(response).await)
 }
 
-/// Author -> quiz_config PATCH -> submit-review -> publish, so the item
-/// is a real `content_type = "quiz"`, published item with an
-/// author-set `max_attempts`. 0 question_groups is deliberate — this
-/// only exercises the attempt-creation gate, not grading.
-async fn create_published_quiz(app: axum::Router, dev_token: &str, reviewer_token: &str, pool: &PgPool, label: &str, max_attempts: Option<i64>) -> String {
-    let subject_id: Uuid = sqlx::query_scalar!(r#"insert into subjects (code, name) values ($1, $1) returning id"#, format!("SUBJ-{label}")).fetch_one(pool).await.unwrap();
-    let (_, module) = send(app.clone(), Method::POST, "/modules", dev_token, json!({"is_folder": false, "subject_id": subject_id, "code": format!("MOD-{label}"), "title": "Module"})).await;
-    let module_id = module["id"].as_str().unwrap().to_string();
-    let (status, item) = send(
-        app.clone(),
-        Method::POST,
-        &format!("/modules/{module_id}/items"),
-        dev_token,
-        json!({"node_type": "item", "title": format!("Quiz {label}"), "content_type": "quiz"}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "{item:?}");
-    let item_id = item["id"].as_str().unwrap().to_string();
+#[sqlx::test]
+async fn converting_a_group_changes_its_type_and_preserves_the_question_count(pool: PgPool) {
+    let (_dev_uid, dev_token) = insert_user_with_role(&pool, "convert-dev@example.com", "curriculum_developer").await;
+    let app = build_app(pool.clone());
 
+    let subject_id: Uuid = sqlx::query_scalar!(r#"insert into subjects (code, name) values ($1, $1) returning id"#, "SUBJ-CONVERT").fetch_one(&pool).await.unwrap();
+    let (_, module) = send(app.clone(), Method::POST, "/modules", &dev_token, json!({"is_folder": false, "subject_id": subject_id, "code": "MOD-CONVERT", "title": "Module"})).await;
+    let module_id = module["id"].as_str().unwrap().to_string();
+    let (_, item) = send(app.clone(), Method::POST, &format!("/modules/{module_id}/items"), &dev_token, json!({"node_type": "item", "title": "Quiz", "content_type": "quiz"})).await;
+    let item_id = item["id"].as_str().unwrap().to_string();
     let (status, patched) = send(
         app.clone(),
         Method::PATCH,
         &format!("/module-items/{item_id}/quiz-config"),
-        dev_token,
-        json!({"quiz_config": {"question_groups": [], "max_attempts": max_attempts}}),
+        &dev_token,
+        json!({"quiz_config": {
+            "sections": [{"section_id": "s1", "title": "Bagian 1"}],
+            "question_groups": [{
+                "group_id": "g0", "type": "multiple_choice", "section_id": "s1",
+                "questions": [{"number": 1, "stem": "Apa ibu kota Indonesia?", "choices": [{"label": "A", "text": "Jakarta"}, {"label": "B", "text": "Bandung"}], "answer": "A"}],
+            }],
+        }}),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{patched:?}");
 
-    let (status, _) = send(app.clone(), Method::POST, &format!("/module-items/{item_id}/submit-review"), dev_token, json!({})).await;
-    assert_eq!(status, StatusCode::OK);
-    let (status, published) = send(app, Method::POST, &format!("/module-items/{item_id}/publish"), reviewer_token, json!({})).await;
-    assert_eq!(status, StatusCode::OK, "{published:?}");
-    item_id
+    let (status, body) = send(
+        app.clone(),
+        Method::POST,
+        "/ai/quiz/convert-group-type",
+        &dev_token,
+        json!({"item_id": item_id, "group_id": "g0", "new_subtype": "true_false"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["question_count"], 1);
+
+    let (_, item) = send(app, Method::GET, &format!("/module-items/{item_id}"), &dev_token, json!({})).await;
+    let g0 = item["quiz_config"]["question_groups"][0].clone();
+    assert_eq!(g0["type"], "true_false", "the group's stored type must actually change: {g0:?}");
+    assert_eq!(g0["questions"][0]["answer"], "True");
+    // Fase 5d — a conversion can lose fidelity, so it's marked draft
+    // like any other automated fill, for the author to review.
+    assert_eq!(g0["ai_meta"]["draft"], true, "{g0:?}");
 }
 
 #[sqlx::test]
-async fn a_learner_may_not_start_beyond_max_attempts(pool: PgPool) {
-    let (_dev_uid, dev_token) = insert_user_with_role(&pool, "maxatt-dev@example.com", "curriculum_developer").await;
-    let (_rev_uid, reviewer_token) = insert_user_with_role(&pool, "maxatt-rev@example.com", "reviewer").await;
-    let (_student_uid, student_token) = insert_user_with_role(&pool, "maxatt-student@example.com", "student").await;
+async fn converting_to_an_unknown_subtype_is_rejected(pool: PgPool) {
+    let (_dev_uid, dev_token) = insert_user_with_role(&pool, "convert-unknown-dev@example.com", "curriculum_developer").await;
     let app = build_app(pool.clone());
 
-    let item_id = create_published_quiz(app.clone(), &dev_token, &reviewer_token, &pool, "MAXATT", Some(2)).await;
+    let subject_id: Uuid = sqlx::query_scalar!(r#"insert into subjects (code, name) values ($1, $1) returning id"#, "SUBJ-CONVERTUNK").fetch_one(&pool).await.unwrap();
+    let (_, module) = send(app.clone(), Method::POST, "/modules", &dev_token, json!({"is_folder": false, "subject_id": subject_id, "code": "MOD-CONVERTUNK", "title": "Module"})).await;
+    let module_id = module["id"].as_str().unwrap().to_string();
+    let (_, item) = send(app.clone(), Method::POST, &format!("/modules/{module_id}/items"), &dev_token, json!({"node_type": "item", "title": "Quiz", "content_type": "quiz"})).await;
+    let item_id = item["id"].as_str().unwrap().to_string();
+    let (status, patched) = send(
+        app.clone(),
+        Method::PATCH,
+        &format!("/module-items/{item_id}/quiz-config"),
+        &dev_token,
+        json!({"quiz_config": {"sections": [{"section_id": "s1", "title": "Bagian 1"}], "question_groups": [{"group_id": "g0", "type": "multiple_choice", "section_id": "s1", "questions": []}]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched:?}");
 
-    // Attempt 1: starts, then submitted so a 2nd may start (only one
-    // in_progress attempt is allowed at a time regardless of the cap).
-    let (status, attempt1) = send(app.clone(), Method::POST, &format!("/lessons/{item_id}/attempts"), &student_token, json!({})).await;
-    assert_eq!(status, StatusCode::CREATED, "{attempt1:?}");
-    let attempt1_id = attempt1["attempt_id"].as_str().unwrap().to_string();
-    let (status, submitted) = send(app.clone(), Method::POST, &format!("/attempts/{attempt1_id}/submit"), &student_token, json!({"quiz_answers": {}})).await;
-    assert_eq!(status, StatusCode::OK, "{submitted:?}");
-
-    // Attempt 2 of 2 -> still allowed.
-    let (status, attempt2) = send(app.clone(), Method::POST, &format!("/lessons/{item_id}/attempts"), &student_token, json!({})).await;
-    assert_eq!(status, StatusCode::CREATED, "{attempt2:?}");
-    let attempt2_id = attempt2["attempt_id"].as_str().unwrap().to_string();
-    let (status, submitted) = send(app.clone(), Method::POST, &format!("/attempts/{attempt2_id}/submit"), &student_token, json!({"quiz_answers": {}})).await;
-    assert_eq!(status, StatusCode::OK, "{submitted:?}");
-
-    // Attempt 3 -> the cap of 2 is already spent -> rejected.
-    let (status, body) = send(app, Method::POST, &format!("/lessons/{item_id}/attempts"), &student_token, json!({})).await;
+    let (status, body) = send(app, Method::POST, "/ai/quiz/convert-group-type", &dev_token, json!({"item_id": item_id, "group_id": "g0", "new_subtype": "not_a_real_subtype"})).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
-    assert_eq!(body["error"], "max_attempts_reached");
-}
-
-#[sqlx::test]
-async fn no_max_attempts_set_keeps_todays_unlimited_behavior(pool: PgPool) {
-    let (_dev_uid, dev_token) = insert_user_with_role(&pool, "noattcap-dev@example.com", "curriculum_developer").await;
-    let (_rev_uid, reviewer_token) = insert_user_with_role(&pool, "noattcap-rev@example.com", "reviewer").await;
-    let (_student_uid, student_token) = insert_user_with_role(&pool, "noattcap-student@example.com", "student").await;
-    let app = build_app(pool.clone());
-
-    let item_id = create_published_quiz(app.clone(), &dev_token, &reviewer_token, &pool, "NOATTCAP", None).await;
-
-    for _ in 0..3 {
-        let (status, attempt) = send(app.clone(), Method::POST, &format!("/lessons/{item_id}/attempts"), &student_token, json!({})).await;
-        assert_eq!(status, StatusCode::CREATED, "{attempt:?}");
-        let attempt_id = attempt["attempt_id"].as_str().unwrap().to_string();
-        let (status, submitted) = send(app.clone(), Method::POST, &format!("/attempts/{attempt_id}/submit"), &student_token, json!({"quiz_answers": {}})).await;
-        assert_eq!(status, StatusCode::OK, "{submitted:?}");
-    }
+    assert_eq!(body["error"], "unknown_subtype");
 }

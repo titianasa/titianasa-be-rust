@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::services::answer_match::{matches_answer, matches_answer_with_options, matches_reorder};
-use crate::services::quiz_config::{QuizQuestion, QuizQuestionGroup};
+use crate::services::quiz_config::{value_to_key, QuizQuestion, QuizQuestionGroup};
 
 /// Compared with `matches_answer_with_options` — surface-variation
 /// tolerant, and aware of a word-bank pool when the group has one.
@@ -81,16 +81,31 @@ pub struct QuestionScore {
 /// The learner's submitted answers, keyed by `QuizQuestion::key()`.
 pub type AnswerState = HashMap<String, Value>;
 
-fn as_string_list(value: Option<&Value>) -> Vec<String> {
-    match value {
-        Some(Value::Array(items)) => items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
-        Some(Value::String(s)) => vec![s.clone()],
-        _ => Vec::new(),
+/// A question's answer is authored as a JSON `Value` the model chose
+/// freely — a quantitative subtype ("isian singkat" asking for a bare
+/// number) very often comes back as a JSON *number*, not a string.
+/// `Value::as_str()` returns `None` for that, so any caller that used it
+/// directly silently treated a numeric answer as empty and never
+/// matched — this is the single conversion every comparison here must
+/// go through instead.
+fn value_text(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(_) => Some(value_to_key(v)),
+        _ => None,
     }
 }
 
-fn as_str(value: Option<&Value>) -> &str {
-    value.and_then(|v| v.as_str()).unwrap_or("")
+fn as_string_list(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::Array(items)) => items.iter().filter_map(value_text).collect(),
+        Some(other) => value_text(other).into_iter().collect(),
+        None => Vec::new(),
+    }
+}
+
+fn as_str(value: Option<&Value>) -> String {
+    value.and_then(value_text).unwrap_or_default()
 }
 
 fn weight_of(value: &Value) -> Option<f64> {
@@ -123,7 +138,7 @@ pub fn score_question(subtype: &str, question: &QuizQuestion, answers: &AnswerSt
         let picked = as_str(submitted);
         let earned = weights
             .iter()
-            .find(|(label, _)| label.as_str() == picked || matches_option_label(picked, label))
+            .find(|(label, _)| label.as_str() == picked || matches_option_label(&picked, label))
             .and_then(|(_, v)| weight_of(v))
             .unwrap_or(0.0);
         return QuestionScore {
@@ -159,7 +174,7 @@ pub fn score_question(subtype: &str, question: &QuizQuestion, answers: &AnswerSt
     }
 
     if REORDER.contains(&subtype) {
-        let ok = matches_reorder(as_str(submitted), question.answer.as_ref());
+        let ok = matches_reorder(&as_str(submitted), question.answer.as_ref());
         return QuestionScore { is_correct: ok, points_earned: i64::from(ok), points_max: 1, needs_eval: false };
     }
 
@@ -174,7 +189,7 @@ pub fn score_question(subtype: &str, question: &QuizQuestion, answers: &AnswerSt
             Some(g) => &g.options,
             None => &empty,
         };
-        let ok = matches_answer_with_options(as_str(submitted), question.answer.as_ref(), pool);
+        let ok = matches_answer_with_options(&as_str(submitted), question.answer.as_ref(), pool);
         return QuestionScore { is_correct: ok, points_earned: i64::from(ok), points_max: 1, needs_eval: false };
     }
 
@@ -183,14 +198,14 @@ pub fn score_question(subtype: &str, question: &QuizQuestion, answers: &AnswerSt
     // let a wrong answer through.
     if is_exact_key_match(subtype) {
         let user = as_str(submitted);
-        let correct = question.answer.as_ref().and_then(|v| v.as_str()).unwrap_or("");
+        let correct = question.answer.as_ref().and_then(value_text).unwrap_or_default();
         let ok = !user.is_empty() && user == correct;
         return QuestionScore { is_correct: ok, points_earned: i64::from(ok), points_max: 1, needs_eval: false };
     }
 
     // Unknown subtype — fall back to fuzzy, which is the safer default
     // for something we have no specific contract for.
-    let ok = matches_answer(as_str(submitted), question.answer.as_ref());
+    let ok = matches_answer(&as_str(submitted), question.answer.as_ref());
     QuestionScore { is_correct: ok, points_earned: i64::from(ok), points_max: 1, needs_eval: false }
 }
 
@@ -253,6 +268,49 @@ mod tests {
         let q = question(json!({"number": 3, "answer": "10 years"}));
         let score = score_question("short_answer", &q, &answers(&[("3", json!("  Ten Years. "))]), None);
         assert!(score.is_correct);
+    }
+
+    // Regression — the QA sweep of every subtype/template (Phase 38)
+    // found nearly every "isian singkat"/numeric short_answer question
+    // failing its own answer key: the model (reasonably) writes a
+    // quantitative answer as a bare JSON *number*, and `Value::as_str()`
+    // returns `None` for that — so the submitted value AND the stored
+    // key both silently became "" before any comparison ever ran. Not a
+    // content-quality issue; every one of these should have scored
+    // correct.
+    #[test]
+    fn a_numeric_json_answer_scores_correct_against_the_identical_number() {
+        let q = question(json!({"number": 1, "answer": 42}));
+        let score = score_question("short_answer", &q, &answers(&[("1", json!(42))]), None);
+        assert!(score.is_correct, "{score:?}");
+    }
+
+    #[test]
+    fn a_numeric_json_answer_still_matches_a_stringified_submission() {
+        // The renderer may submit what the learner typed as a string
+        // even though the key itself is a number — both directions must
+        // resolve to the same comparison.
+        let q = question(json!({"number": 1, "answer": 1.5}));
+        let score = score_question("short_answer", &q, &answers(&[("1", json!("1,5"))]), None);
+        assert!(score.is_correct, "{score:?}");
+    }
+
+    #[test]
+    fn a_wrong_numeric_answer_still_scores_incorrect() {
+        let q = question(json!({"number": 1, "answer": 42}));
+        let score = score_question("short_answer", &q, &answers(&[("1", json!(41))]), None);
+        assert!(!score.is_correct);
+    }
+
+    #[test]
+    fn multi_mark_numeric_indices_are_no_longer_silently_dropped() {
+        // highlight_incorrect_words stores indices, not letters — an
+        // array of JSON numbers hit the exact same bug via
+        // `as_string_list`.
+        let q = question(json!({"number": "1-2", "answer": [3, 7]}));
+        let score = score_question("highlight_incorrect_words", &q, &answers(&[("1-2", json!([3, 7]))]), None);
+        assert!(score.is_correct, "{score:?}");
+        assert_eq!(score.points_earned, 2);
     }
 
     #[test]

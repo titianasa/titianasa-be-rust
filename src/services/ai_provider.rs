@@ -51,6 +51,11 @@ pub struct SpeechResult {
     pub content_type: String,
 }
 
+/// A live sequence of text deltas, e.g. one Gemini `streamGenerateContent`
+/// chunk at a time — Live AI Chat forwards each one straight to the
+/// browser as it arrives instead of waiting for the whole reply.
+pub type TextChunkStream = std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<String, AIProviderError>> + Send>>;
+
 #[async_trait::async_trait]
 pub trait AIProvider: Send + Sync {
     async fn generate(&self, req: GenerationRequest) -> Result<GenerationResponse, AIProviderError>;
@@ -58,6 +63,15 @@ pub trait AIProvider: Send + Sync {
     // GenerationRequest.model, not baked into the provider instance.
     async fn transcribe(&self, audio: &[u8], mime_type: &str, model: &str) -> Result<TranscriptionResult, AIProviderError>;
     async fn synthesize_speech(&self, text: &str, voice: &str, model: &str) -> Result<SpeechResult, AIProviderError>;
+    /// Incremental generation. Default falls back to one non-streaming
+    /// `generate()` call, yielded as a single chunk — real
+    /// token-by-token streaming is opt-in per provider (currently only
+    /// `VertexGeminiProvider`), so this trait doesn't force every
+    /// implementor (including the two test doubles) to have one.
+    async fn generate_stream(&self, req: GenerationRequest) -> Result<TextChunkStream, AIProviderError> {
+        let resp = self.generate(req).await?;
+        Ok(Box::pin(futures_util::stream::once(async move { Ok(resp.text) })))
+    }
 }
 
 // Models don't reliably follow "no markdown fences" instructions — strip
@@ -85,13 +99,12 @@ fn http_client() -> &'static reqwest::Client {
 /// generation (`GET /ai/models`), deliberately NOT every model
 /// OpenRouter exposes — each entry here is a price/quality tradeoff
 /// worth naming for a non-technical author, not a raw model catalog.
-/// Both confirmed on OpenRouter to support `response_format: json_object`
-/// (required by the quiz generator's JSON-mode calls) and image input.
-/// First entry is the default. Phase 38 (K2).
-pub const AI_MODEL_OPTIONS: &[(&str, &str)] = &[
-    ("deepseek/deepseek-v4.1-flash", "Cepat"),
-    ("deepseek/deepseek-v4-pro", "Kualitas tinggi"),
-];
+/// Text-generation models an author may pick, resolved against
+/// `AppState::text_ai_provider` (Vertex AI Gemini as of the GCP
+/// migration — see `services::vertex_ai_provider`). First entry is the
+/// default. Phase 38 (K2); GCP migration swapped the entries from
+/// OpenRouter/DeepSeek ids to Vertex Gemini ids.
+pub const AI_MODEL_OPTIONS: &[(&str, &str)] = &[("gemini-3.8-flash", "Cepat")];
 
 pub fn default_ai_model() -> &'static str {
     AI_MODEL_OPTIONS[0].0
@@ -176,9 +189,27 @@ fn capped_max_tokens(model_max: Option<i64>, fallback: i64) -> i64 {
     model_max.map_or(fallback, |model_max| model_max.min(fallback))
 }
 
+// Vertex's models live in a different id namespace than OpenRouter's
+// catalogue, so the lookup below can never resolve one: every Vertex
+// call has been falling through to the caller's fallback with no real
+// ceiling behind it since the GCP migration. These are the limits
+// Vertex itself enforces — asking `gemini-3.8-flash` for more is a hard
+// 400: "supported range is from 1 (inclusive) to 65537 (exclusive)".
+const VERTEX_MODEL_MAX_TOKENS: &[(&str, i64)] = &[("gemini-3.8-flash", 65_536)];
+
+fn vertex_model_max_tokens(model: &str) -> Option<i64> {
+    VERTEX_MODEL_MAX_TOKENS.iter().find(|(id, _)| *id == model).map(|(_, max)| *max)
+}
+
 // Falls back to `fallback` if the model isn't in OpenRouter's list or the
 // lookup itself fails — never fails the caller's generation attempt.
 pub async fn resolve_max_tokens(model: &str, fallback: i64) -> i64 {
+    // A Vertex model's ceiling is known right here, so there is nothing
+    // to wait on a network catalogue for — and the catalogue could not
+    // answer for this id anyway.
+    if let Some(model_max) = vertex_model_max_tokens(model) {
+        return capped_max_tokens(Some(model_max), fallback);
+    }
     match MODEL_MAX_TOKENS.get_or_try_init(fetch_model_max_tokens).await {
         Ok(map) => capped_max_tokens(map.get(model).copied(), fallback),
         Err(e) => {
@@ -503,5 +534,24 @@ mod tests {
         assert_eq!(capped_max_tokens(Some(500), 32_000), 500);
         // Model not found in OpenRouter's list — fall through untouched.
         assert_eq!(capped_max_tokens(None, 16_000), 16_000);
+    }
+
+    // The number here is not a guess: Vertex rejects anything higher for
+    // this model with "supported range is from 1 (inclusive) to 65537
+    // (exclusive)", and 65_536 is accepted.
+    #[test]
+    fn the_vertex_ceiling_is_known_locally_rather_than_looked_up() {
+        assert_eq!(vertex_model_max_tokens("gemini-3.8-flash"), Some(65_536));
+        // Anything not a Vertex model still goes to the catalogue path.
+        assert_eq!(vertex_model_max_tokens("deepseek/deepseek-v4.1-flash"), None);
+    }
+
+    #[test]
+    fn an_article_asking_for_the_whole_budget_is_clamped_to_what_vertex_allows() {
+        // Article generation asks for 65_536 deliberately; a caller must
+        // never end up requesting more than Vertex will accept.
+        let ceiling = vertex_model_max_tokens("gemini-3.8-flash");
+        assert_eq!(capped_max_tokens(ceiling, 65_536), 65_536);
+        assert_eq!(capped_max_tokens(ceiling, 1_000_000), 65_536);
     }
 }

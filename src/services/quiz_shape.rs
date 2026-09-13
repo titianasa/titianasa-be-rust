@@ -27,6 +27,19 @@ pub struct ShapeSpec {
     pub emits: &'static [&'static str],
 }
 
+/// A handful of shapes hard-cap how many questions one group can ever
+/// hold — `HighlightWords` scores its whole transcript as ONE question
+/// (see its rules below), so asking the model for "3 soal" on top of
+/// that contradicts the shape's own spec and reliably produced zero
+/// questions rather than either number. `build_prompt` uses this to
+/// override the caller's requested count instead of passing it through.
+pub fn fixed_question_count(shape: SubtypeShape) -> Option<i64> {
+    match shape {
+        SubtypeShape::HighlightWords => Some(1),
+        _ => None,
+    }
+}
+
 pub fn spec(shape: SubtypeShape) -> ShapeSpec {
     match shape {
         SubtypeShape::Mcq => ShapeSpec {
@@ -43,7 +56,7 @@ pub fn spec(shape: SubtypeShape) -> ShapeSpec {
         {"label": "D", "text": "Medan"}
       ],
       "answer": "B",
-      "explanation": "Jakarta adalah ibu kota Indonesia sejak 1945."
+      "explanation": "Jakarta adalah ibu kota Indonesia sejak 1945.", "taxonomy": {"difficulty": "sedang", "bloom": "c2"}
     }
   ]
 }"#,
@@ -70,7 +83,7 @@ pub fn spec(shape: SubtypeShape) -> ShapeSpec {
         {"label": "E", "text": "Hanya terjadi malam hari"}
       ],
       "answer": ["A", "C"],
-      "explanation": "Fotosintesis membutuhkan cahaya dan menghasilkan oksigen."
+      "explanation": "Fotosintesis membutuhkan cahaya dan menghasilkan oksigen.", "taxonomy": {"difficulty": "sedang", "bloom": "c2"}
     }
   ]
 }"#,
@@ -86,8 +99,8 @@ pub fn spec(shape: SubtypeShape) -> ShapeSpec {
             schema: r#"{
   "options": ["Benar", "Salah"],
   "questions": [
-    {"number": 1, "text": "Produksi padi 2023 melebihi 31 juta ton.", "answer": "Benar", "explanation": "Teks menyebut 31,5 juta ton."},
-    {"number": 2, "text": "Produksi padi turun dibanding tahun sebelumnya.", "answer": "Salah", "explanation": "Teks menyebut kenaikan dari 30 juta ton."}
+    {"number": 1, "text": "Produksi padi 2023 melebihi 31 juta ton.", "answer": "Benar", "explanation": "Teks menyebut 31,5 juta ton.", "taxonomy": {"difficulty": "sedang", "bloom": "c2"}},
+    {"number": 2, "text": "Produksi padi turun dibanding tahun sebelumnya.", "answer": "Salah", "explanation": "Teks menyebut kenaikan dari 30 juta ton.", "taxonomy": {"difficulty": "sulit", "bloom": "c4"}}
   ]
 }"#,
             rules: &[
@@ -102,7 +115,7 @@ pub fn spec(shape: SubtypeShape) -> ShapeSpec {
             description: "Jawaban teks singkat, dicocokkan toleran.",
             schema: r#"{
   "questions": [
-    {"number": 1, "stem": "Berapa lama proses pemulihan berlangsung?", "answer": "10 tahun|sepuluh tahun", "explanation": "Teks menyebut pemulihan memakan waktu 10 tahun."}
+    {"number": 1, "stem": "Berapa lama proses pemulihan berlangsung?", "answer": "10 tahun|sepuluh tahun", "explanation": "Teks menyebut pemulihan memakan waktu 10 tahun.", "taxonomy": {"difficulty": "sedang", "bloom": "c2"}}
   ]
 }"#,
             rules: &[
@@ -120,7 +133,7 @@ pub fn spec(shape: SubtypeShape) -> ShapeSpec {
     {"label": "B", "text": "respirasi"}
   ],
   "questions": [
-    {"number": 1, "label": "Menghasilkan oksigen", "answer": "fotosintesis", "explanation": "Fotosintesis melepaskan oksigen."}
+    {"number": 1, "label": "Menghasilkan oksigen", "answer": "fotosintesis", "explanation": "Fotosintesis melepaskan oksigen.", "taxonomy": {"difficulty": "sedang", "bloom": "c2"}}
   ]
 }"#,
             rules: &[
@@ -144,7 +157,7 @@ pub fn spec(shape: SubtypeShape) -> ShapeSpec {
     {"label": "B", "question_number": 2, "text": "Paragraf kedua ..."}
   ],
   "questions": [
-    {"number": 1, "answer": "Penyebab menurunnya populasi", "explanation": "Bagian A membahas sebab menurunnya populasi."}
+    {"number": 1, "answer": "Penyebab menurunnya populasi", "explanation": "Bagian A membahas sebab menurunnya populasi.", "taxonomy": {"difficulty": "sedang", "bloom": "c2"}}
   ]
 }"#,
             rules: &[
@@ -168,8 +181,8 @@ pub fn spec(shape: SubtypeShape) -> ShapeSpec {
     }
   ],
   "questions": [
-    {"number": 1, "answer": "2", "explanation": "Teks menyebut kenaikan 2 derajat."},
-    {"number": 2, "answer": "2016", "explanation": "Peristiwa pemutihan terjadi pada 2016."}
+    {"number": 1, "answer": "2", "explanation": "Teks menyebut kenaikan 2 derajat.", "taxonomy": {"difficulty": "sedang", "bloom": "c2"}},
+    {"number": 2, "answer": "2016", "explanation": "Peristiwa pemutihan terjadi pada 2016.", "taxonomy": {"difficulty": "sulit", "bloom": "c4"}}
   ]
 }"#,
             rules: &[
@@ -189,7 +202,7 @@ pub fn spec(shape: SubtypeShape) -> ShapeSpec {
     {"cells": [{"text": "Tahun keruntuhan"}, {"question_number": 2}]}
   ],
   "questions": [
-    {"number": 1, "answer": "1%", "explanation": "Teks menyebut kurang dari 1% dasar laut."}
+    {"number": 1, "answer": "1%", "explanation": "Teks menyebut kurang dari 1% dasar laut.", "taxonomy": {"difficulty": "sedang", "bloom": "c2"}}
   ]
 }"#,
             rules: &[
@@ -211,7 +224,7 @@ pub fn spec(shape: SubtypeShape) -> ShapeSpec {
     {"question_number": 2}
   ],
   "questions": [
-    {"number": 1, "answer": "nektar", "explanation": "Lebah mengumpulkan nektar dari bunga."}
+    {"number": 1, "answer": "nektar", "explanation": "Lebah mengumpulkan nektar dari bunga.", "taxonomy": {"difficulty": "sedang", "bloom": "c2"}}
   ]
 }"#,
             rules: &[
@@ -230,7 +243,7 @@ pub fn spec(shape: SubtypeShape) -> ShapeSpec {
       "stem": "Susun menjadi kalimat yang benar.",
       "scrambled": ["ke", "sekolah", "Saya", "pergi"],
       "answer": "Saya pergi ke sekolah",
-      "explanation": "Pola dasar: Subjek + Predikat + Keterangan."
+      "explanation": "Pola dasar: Subjek + Predikat + Keterangan.", "taxonomy": {"difficulty": "sedang", "bloom": "c2"}
     }
   ]
 }"#,
@@ -245,7 +258,7 @@ pub fn spec(shape: SubtypeShape) -> ShapeSpec {
             description: "Inventori skala 1-5; tidak ada jawaban benar atau salah.",
             schema: r#"{
   "questions": [
-    {"number": 1, "stem": "Saya nyaman bekerja dalam tim.", "explanation": "Mengukur orientasi kolaboratif."}
+    {"number": 1, "stem": "Saya nyaman bekerja dalam tim.", "explanation": "Mengukur orientasi kolaboratif.", "taxonomy": {"difficulty": "sedang", "bloom": "c2"}}
   ]
 }"#,
             rules: &[
@@ -265,7 +278,7 @@ pub fn spec(shape: SubtypeShape) -> ShapeSpec {
       "min_words": 150,
       "max_words": 300,
       "rubric": "Isi (40), Struktur (30), Bahasa (30)",
-      "explanation": "Jawaban kuat menyebut pergeseran musim tanam dan gagal panen."
+      "explanation": "Jawaban kuat menyebut pergeseran musim tanam dan gagal panen.", "taxonomy": {"difficulty": "sedang", "bloom": "c2"}
     }
   ]
 }"#,
@@ -288,7 +301,7 @@ pub fn spec(shape: SubtypeShape) -> ShapeSpec {
             schema: r#"{
   "transcript_words": ["Lebah", "menyerbuki", "sembilan", "puluh", "persen", "tanaman"],
   "questions": [
-    {"number": 1, "answer": ["2", "3"], "explanation": "Audio menyebut tujuh puluh persen, bukan sembilan puluh."}
+    {"number": 1, "answer": ["2", "3"], "explanation": "Audio menyebut tujuh puluh persen, bukan sembilan puluh.", "taxonomy": {"difficulty": "sedang", "bloom": "c2"}}
   ]
 }"#,
             rules: &[
@@ -306,7 +319,7 @@ pub fn spec(shape: SubtypeShape) -> ShapeSpec {
     {"title": "Rencana liburan", "starter": "Ke mana kamu ingin berlibur?", "follow_up_questions": ["Kenapa?", "Dengan siapa?"], "vocab": ["itinerary", "budget"]}
   ],
   "questions": [
-    {"number": 1, "prompt": "Lakukan percakapan berpasangan menggunakan kartu di atas.", "explanation": "Tutor menilai kelancaran dan ketepatan kosakata."}
+    {"number": 1, "prompt": "Lakukan percakapan berpasangan menggunakan kartu di atas.", "explanation": "Tutor menilai kelancaran dan ketepatan kosakata.", "taxonomy": {"difficulty": "sedang", "bloom": "c2"}}
   ]
 }"#,
             rules: &[
@@ -399,5 +412,46 @@ mod tests {
     fn drag_and_drop_demands_an_option_pool() {
         assert!(variant_rules(Some("ielts"), false).iter().any(|r| r.contains("options")));
         assert!(variant_rules(Some("default"), false).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod taxonomy_schema_tests {
+    use super::*;
+
+    /// The schema string is what the model copies, so a taxonomy rule in
+    /// the prompt that no example demonstrates gets ignored roughly as
+    /// often as it gets followed. Every worked example that shows an
+    /// `explanation` must show a `taxonomy` beside it — and the example
+    /// has to stay parseable, since a malformed one teaches malformed
+    /// output.
+    #[test]
+    fn every_worked_example_is_valid_json_and_classifies_its_questions() {
+        use crate::services::quiz_taxonomy::{BloomLevel, DifficultyLevel};
+
+        // Driven off the subtype registry rather than a hand-kept
+        // shape list, so a shape added with a new subtype is covered
+        // the moment it exists.
+        for info in crate::services::quiz_subtype::SUBTYPES {
+            let shape = info.shape;
+            let spec = spec(shape);
+            let parsed: serde_json::Value = serde_json::from_str(spec.schema)
+                .unwrap_or_else(|e| panic!("{shape:?} schema is not valid JSON: {e}"));
+
+            let Some(questions) = parsed.get("questions").and_then(|q| q.as_array()) else { continue };
+            for q in questions {
+                // Only examples that bother to show an explanation are
+                // full worked questions; the sparser ones illustrate a
+                // structure, not a complete item.
+                if q.get("explanation").is_none() {
+                    continue;
+                }
+                let tax = q.get("taxonomy").unwrap_or_else(|| panic!("{shape:?}: a worked example has no `taxonomy`"));
+                let difficulty = tax.get("difficulty").and_then(|v| v.as_str()).unwrap_or("");
+                let bloom = tax.get("bloom").and_then(|v| v.as_str()).unwrap_or("");
+                assert!(DifficultyLevel::parse(difficulty).is_some(), "{shape:?}: bad difficulty {difficulty:?}");
+                assert!(BloomLevel::parse(bloom).is_some(), "{shape:?}: bad bloom {bloom:?}");
+            }
+        }
     }
 }
