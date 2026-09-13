@@ -1,3 +1,5 @@
+use sqlx::PgPool;
+
 use crate::errors::AppError;
 use crate::services::ai_provider::{resolve_max_tokens, strip_code_fence, AIProvider, GenerationRequest, SpeechResult};
 
@@ -147,12 +149,12 @@ fn turn_user_prompt(req: &TurnRequest) -> String {
 // endpoint is a deliberate exception to the codebase's snake_case
 // convention, since the handler forwards the model's own JSON output
 // verbatim rather than re-keying it into a typed DTO.
-pub async fn generate_turn(ai: &dyn AIProvider, model: &str, req: TurnRequest) -> Result<serde_json::Value, AppError> {
+pub async fn generate_turn(pool: &PgPool, ai: &dyn AIProvider, model: &str, req: TurnRequest) -> Result<serde_json::Value, AppError> {
     if req.user_message.trim().is_empty() {
         return Err(AppError::UnprocessableEntity("user_message_required", "userMessage must not be empty".to_string()));
     }
 
-    let max_tokens = resolve_max_tokens(model, 4096).await;
+    let max_tokens = resolve_max_tokens(pool, model, 4096).await;
     let generation = ai
         .generate(GenerationRequest {
             model: model.to_string(),
@@ -195,7 +197,7 @@ pub struct SessionSummaryRequest {
     pub language: Option<LanguageInput>,
 }
 
-pub async fn generate_session_summary(ai: &dyn AIProvider, model: &str, req: SessionSummaryRequest) -> Result<serde_json::Value, AppError> {
+pub async fn generate_session_summary(pool: &PgPool, ai: &dyn AIProvider, model: &str, req: SessionSummaryRequest) -> Result<serde_json::Value, AppError> {
     let lang_name = req.language.as_ref().map(|l| l.name.as_str()).unwrap_or("English");
     let default_indonesian = format!("Bahasa {lang_name}");
     let lang_indonesian = req.language.as_ref().and_then(|l| l.indonesian_name.as_deref()).unwrap_or(&default_indonesian);
@@ -223,7 +225,7 @@ Evaluate the student's speaking performance:\n\
 7. Encouraging closing feedback in {lang_name} (closingNoteTargetLanguage) and a warm summary in Indonesian (closingNoteIndonesian)"
     );
 
-    let max_tokens = resolve_max_tokens(model, 3000).await;
+    let max_tokens = resolve_max_tokens(pool, model, 3000).await;
     let generation = ai
         .generate(GenerationRequest { model: model.to_string(), system_prompt, user_prompt, temperature: 0.5, max_tokens, image_url: None, json_mode: true })
         .await

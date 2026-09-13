@@ -19,7 +19,8 @@ pub async fn post_live_chat_turn(
     Extension(ctx): Extension<AuthContext>,
     ValidatedJson(body): ValidatedJson<ChatTurnRequest>,
 ) -> Result<Json<ChatTurnResponse>, AppError> {
-    Ok(Json(live_chat::generate_turn(&state.db, state.text_ai_provider.as_ref(), &state.config.ai_live_chat_model, &ctx, body).await?))
+    let model = crate::services::ai_settings::resolve(&state.db, &state.config, "live_chat").await?.model_id;
+    Ok(Json(live_chat::generate_turn(&state.db, state.text_ai_provider.as_ref(), &model, &ctx, body).await?))
 }
 
 // POST /ai/live-chat-turn/stream — same turn, forwarded to the browser
@@ -33,6 +34,7 @@ pub async fn post_live_chat_turn_stream(
     Extension(ctx): Extension<AuthContext>,
     ValidatedJson(body): ValidatedJson<ChatTurnRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
-    let stream = live_chat::generate_turn_stream(state.db.clone(), state.text_ai_provider.clone(), state.config.ai_live_chat_model.clone(), ctx, body).await?;
+    let model = crate::services::ai_settings::resolve(&state.db, &state.config, "live_chat").await?.model_id;
+    let stream = live_chat::generate_turn_stream(state.db.clone(), state.text_ai_provider.clone(), model, ctx, body).await?;
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }

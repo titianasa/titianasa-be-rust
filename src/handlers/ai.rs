@@ -12,29 +12,31 @@ use crate::models::requests::ai::{EvaluateRequest, GenerateLessonRequest, Genera
 use crate::services::ai_content::{self, GenerateLessonResponse, GenerateQuestionsResponse, LessonGenerationBlueprint, QuestionGenerationBlueprint};
 use crate::services::ai_gateway::{self, EvaluateResponse};
 use crate::services::ai_ocr::{self, OcrToQuestionBlueprint, OcrToQuestionResponse};
-use crate::services::ai_provider::{default_ai_model, AI_MODEL_OPTIONS};
 use crate::state::AppState;
 
 #[derive(serde::Serialize)]
 pub struct AiModelOption {
-    pub id: &'static str,
-    pub label: &'static str,
+    pub id: String,
+    pub label: String,
 }
 
 #[derive(serde::Serialize)]
 pub struct AiModelsResponse {
     pub models: Vec<AiModelOption>,
-    pub default_model: &'static str,
+    pub default_model: String,
 }
 
 // GET /ai/models — the allowlist an author may pick from when
-// generating text/quiz content (Phase 38). Not a proxy of OpenRouter's
-// full catalog — see AI_MODEL_OPTIONS for why it's curated.
-pub async fn get_ai_models() -> Json<AiModelsResponse> {
-    Json(AiModelsResponse {
-        models: AI_MODEL_OPTIONS.iter().map(|(id, label)| AiModelOption { id, label }).collect(),
-        default_model: default_ai_model(),
-    })
+// generating text/quiz content (Phase 38). P40-003: now the AI model
+// catalog's enabled, text-capable rows (Pengaturan AI), not a hardcoded
+// const — an admin toggling a model off removes it from this list on
+// the next call. `default_model` is `lesson_generation`'s resolved
+// model (the role every one of these call sites' `body.model: None`
+// ultimately falls through to today).
+pub async fn get_ai_models(State(state): State<Arc<AppState>>) -> Result<Json<AiModelsResponse>, AppError> {
+    let options = crate::services::ai_settings::text_capable_models(&state.db).await?;
+    let default_model = crate::services::ai_settings::resolve(&state.db, &state.config, "lesson_generation").await?.model_id;
+    Ok(Json(AiModelsResponse { models: options.into_iter().map(|c| AiModelOption { id: c.model_id, label: c.label }).collect(), default_model }))
 }
 
 // POST /ai/evaluate
@@ -56,7 +58,8 @@ pub async fn post_generate_lesson(State(state): State<Arc<AppState>>, Extension(
         concept_ids: body.concept_ids.unwrap_or_default(),
         subject_id: body.subject_id,
     };
-    let result = ai_content::generate_lesson(&state.db, &ctx, state.text_ai_provider.as_ref(), &state.config.ai_lesson_generation_model, blueprint).await?;
+    let model = crate::services::ai_settings::resolve(&state.db, &state.config, "lesson_generation").await?.model_id;
+    let result = ai_content::generate_lesson(&state.db, &ctx, state.text_ai_provider.as_ref(), &model, blueprint).await?;
     Ok((StatusCode::CREATED, Json(result)))
 }
 
@@ -68,7 +71,8 @@ pub async fn post_generate_questions(
     ValidatedJson(body): ValidatedJson<GenerateQuestionsRequest>,
 ) -> Result<(StatusCode, Json<GenerateQuestionsResponse>), AppError> {
     let blueprint = QuestionGenerationBlueprint { bank_id: body.bank_id, question_type: body.question_type, topic: body.topic, count: body.count, difficulty: body.difficulty, concept_ids: body.concept_ids.unwrap_or_default() };
-    let result = ai_content::generate_questions(&state.db, &ctx, state.text_ai_provider.as_ref(), &state.config.ai_question_generation_model, blueprint).await?;
+    let model = crate::services::ai_settings::resolve(&state.db, &state.config, "question_generation").await?.model_id;
+    let result = ai_content::generate_questions(&state.db, &ctx, state.text_ai_provider.as_ref(), &model, blueprint).await?;
     Ok((StatusCode::CREATED, Json(result)))
 }
 
@@ -76,7 +80,8 @@ pub async fn post_generate_questions(
 // gate as POST /question-banks/{id}/questions).
 pub async fn post_ocr_to_question(State(state): State<Arc<AppState>>, Extension(ctx): Extension<AuthContext>, ValidatedJson(body): ValidatedJson<OcrToQuestionRequest>) -> Result<(StatusCode, Json<OcrToQuestionResponse>), AppError> {
     let blueprint = OcrToQuestionBlueprint { bank_id: body.bank_id, asset_id: body.asset_id, concept_ids: body.concept_ids.unwrap_or_default() };
-    let result = ai_ocr::ocr_to_question(&state.db, &state.config, &ctx, state.text_ai_provider.as_ref(), &state.config.ai_ocr_model, state.storage.as_ref(), blueprint).await?;
+    let model = crate::services::ai_settings::resolve(&state.db, &state.config, "ocr").await?.model_id;
+    let result = ai_ocr::ocr_to_question(&state.db, &state.config, &ctx, state.text_ai_provider.as_ref(), &model, state.storage.as_ref(), blueprint).await?;
     Ok((StatusCode::CREATED, Json(result)))
 }
 
@@ -111,7 +116,8 @@ pub async fn post_transcribe_audio(
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to read asset: {e}")))?;
 
-    match state.ai_provider.transcribe(&object.bytes, &object.content_type, &state.config.ai_stt_model).await {
+    let model = crate::services::ai_settings::resolve(&state.db, &state.config, "stt").await?.model_id;
+    match state.ai_provider.transcribe(&object.bytes, &object.content_type, &model).await {
         Ok(result) => Ok(Json(serde_json::json!({ "transcript": result.text }))),
         Err(e) => {
             tracing::warn!(error = ?e, asset_id = %body.asset_id, "audio transcription failed");
@@ -133,9 +139,9 @@ pub async fn post_generate_quiz_group(
     // the text path, not OCR: extracting from a photographed page needs
     // a specific vision-capable model, not whatever the author picked.
     let model = if body.asset_id.is_some() {
-        state.config.ai_ocr_model.as_str()
+        crate::services::ai_settings::resolve(&state.db, &state.config, "ocr").await?.model_id
     } else {
-        crate::services::ai_provider::resolve_ai_model(body.model.as_deref(), &state.config.ai_lesson_generation_model)?
+        crate::services::ai_provider::resolve_ai_model(&state.db, &state.config, "quiz_generation", body.model.as_deref()).await?
     };
     let blueprint = QuizGenerationBlueprint {
         item_id: body.item_id,
@@ -156,7 +162,7 @@ pub async fn post_generate_quiz_group(
         state.text_ai_provider.as_ref(),
         state.storage.as_ref(),
         &ctx,
-        model,
+        &model,
         blueprint,
     )
     .await?;
@@ -170,14 +176,14 @@ pub async fn post_generate_quiz_batch(
     ValidatedJson(body): ValidatedJson<crate::models::requests::ai::GenerateQuizBatchRequest>,
 ) -> Result<Json<crate::services::quiz_generation::BatchGenerationResponse>, AppError> {
     use crate::services::quiz_generation::generate_batch;
-    let model = crate::services::ai_provider::resolve_ai_model(body.model.as_deref(), &state.config.ai_lesson_generation_model)?;
+    let model = crate::services::ai_provider::resolve_ai_model(&state.db, &state.config, "quiz_generation", body.model.as_deref()).await?;
     let result = generate_batch(
         &state.db,
         &state.config,
         state.text_ai_provider.as_ref(),
         state.storage.as_ref(),
         &ctx,
-        model,
+        &model,
         body.item_id,
         body.count,
     )
@@ -192,14 +198,14 @@ pub async fn post_convert_group_type(
     ValidatedJson(body): ValidatedJson<crate::models::requests::ai::ConvertGroupTypeRequest>,
 ) -> Result<Json<crate::services::quiz_generation::QuizGenerationResponse>, AppError> {
     use crate::services::quiz_generation::convert_group_type;
-    let model = crate::services::ai_provider::resolve_ai_model(body.model.as_deref(), &state.config.ai_lesson_generation_model)?;
+    let model = crate::services::ai_provider::resolve_ai_model(&state.db, &state.config, "quiz_generation", body.model.as_deref()).await?;
     let result = convert_group_type(
         &state.db,
         &state.config,
         state.text_ai_provider.as_ref(),
         state.storage.as_ref(),
         &ctx,
-        model,
+        &model,
         body.item_id,
         body.group_id,
         body.new_subtype,
@@ -215,7 +221,7 @@ pub async fn post_suggest_group_types(
     ValidatedJson(body): ValidatedJson<crate::models::requests::ai::SuggestGroupTypesRequest>,
 ) -> Result<Json<crate::services::quiz_generation::SuggestGroupTypesResponse>, AppError> {
     use crate::services::quiz_generation::suggest_group_types;
-    let model = crate::services::ai_provider::resolve_ai_model(body.model.as_deref(), &state.config.ai_lesson_generation_model)?;
-    let result = suggest_group_types(&state.db, state.text_ai_provider.as_ref(), &ctx, model, &body.document_text).await?;
+    let model = crate::services::ai_provider::resolve_ai_model(&state.db, &state.config, "quiz_generation", body.model.as_deref()).await?;
+    let result = suggest_group_types(&state.db, state.text_ai_provider.as_ref(), &ctx, &model, &body.document_text).await?;
     Ok(Json(result))
 }

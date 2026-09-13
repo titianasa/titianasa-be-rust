@@ -177,7 +177,7 @@ pub async fn generate_turn(pool: &PgPool, ai: &dyn AIProvider, model: &str, ctx:
     record_question_event(pool, ctx.user_id, req.item_id, &plan, section_index, message).await;
 
     let ai_task_id = Uuid::new_v4();
-    let max_tokens = resolve_max_tokens(model, 900).await;
+    let max_tokens = resolve_max_tokens(pool, model, 900).await;
     let request = GenerationRequest {
         model: model.to_string(),
         system_prompt: system_prompt(&plan, section_index, language_label),
@@ -257,7 +257,7 @@ pub async fn generate_turn_stream(
     record_question_event(&pool, ctx.user_id, req.item_id, &plan, section_index, &message).await;
 
     let ai_task_id = Uuid::new_v4();
-    let max_tokens = resolve_max_tokens(&model, 900).await;
+    let max_tokens = resolve_max_tokens(&pool, &model, 900).await;
     let request = GenerationRequest {
         model: model.clone(),
         system_prompt: system_prompt(&plan, section_index, language_label),

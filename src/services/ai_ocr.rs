@@ -99,7 +99,7 @@ pub async fn ocr_to_question(pool: &PgPool, config: &Config, ctx: &AuthContext, 
     let image_url = storage.signed_url(&asset.id.to_string(), config.asset_signed_url_ttl_seconds as u64).await?;
 
     let (system_prompt, user_prompt) = ocr_prompt();
-    let max_tokens = resolve_max_tokens(model, 4096).await;
+    let max_tokens = resolve_max_tokens(pool, model, 4096).await;
     let request = GenerationRequest { model: model.to_string(), system_prompt, user_prompt, temperature: 0.2, max_tokens, image_url: Some(image_url), json_mode: false };
 
     let ai_task_id = Uuid::new_v4();

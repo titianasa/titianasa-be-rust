@@ -69,7 +69,7 @@ pub async fn generate_fragment(pool: &PgPool, ai: &dyn AIProvider, model: &str, 
     }
 
     let ai_task_id = Uuid::new_v4();
-    let max_tokens = resolve_max_tokens(model, 3000).await;
+    let max_tokens = resolve_max_tokens(pool, model, 3000).await;
     let request = GenerationRequest {
         model: model.to_string(),
         system_prompt: system_prompt(),

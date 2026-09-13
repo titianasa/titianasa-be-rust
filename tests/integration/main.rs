@@ -15,8 +15,11 @@
 // A new integration test file goes in this directory AND needs a `mod`
 // line below — a file left out of this list silently never runs.
 
+mod admin_audit_test;
+mod admin_metrics_test;
 mod ai_content_test;
 mod ai_gateway_test;
+mod ai_settings_test;
 mod ai_retry_test;
 mod attempt_submission_test;
 mod attendance_test;
@@ -25,11 +28,13 @@ mod client_events_test;
 mod drive_test;
 mod economy_test;
 mod gamification_test;
+mod job_queue_test;
 mod learning_event_test;
 mod learning_test;
 mod live_chat_test;
 mod marketplace_test;
 mod messaging_test;
+mod metrics_rollup_test;
 mod module_item_versions_test;
 mod organization_test;
 mod proctoring_test;

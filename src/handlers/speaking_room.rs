@@ -33,14 +33,16 @@ pub async fn post_turn(State(state): State<Arc<AppState>>, Extension(_ctx): Exte
         mode: body.mode,
         language: body.language,
     };
-    let result = speaking_room::generate_turn(state.text_ai_provider.as_ref(), &state.config.ai_speaking_room_text_model, req).await?;
+    let model = crate::services::ai_settings::resolve(&state.db, &state.config, "speaking_room_text").await?.model_id;
+    let result = speaking_room::generate_turn(&state.db, state.text_ai_provider.as_ref(), &model, req).await?;
     Ok(Json(result))
 }
 
 // POST /speaking-room/summary
 pub async fn post_summary(State(state): State<Arc<AppState>>, Extension(_ctx): Extension<AuthContext>, ValidatedJson(body): ValidatedJson<PostSummaryRequest>) -> Result<Json<serde_json::Value>, AppError> {
     let req = SessionSummaryRequest { messages: body.messages, scenario: body.scenario, level: body.level, language: body.language };
-    let result = speaking_room::generate_session_summary(state.text_ai_provider.as_ref(), &state.config.ai_speaking_room_text_model, req).await?;
+    let model = crate::services::ai_settings::resolve(&state.db, &state.config, "speaking_room_text").await?.model_id;
+    let result = speaking_room::generate_session_summary(&state.db, state.text_ai_provider.as_ref(), &model, req).await?;
     Ok(Json(result))
 }
 
@@ -49,7 +51,8 @@ pub async fn post_summary(State(state): State<Arc<AppState>>, Extension(_ctx): E
 // precedent of returning bytes directly).
 pub async fn post_tts(State(state): State<Arc<AppState>>, Extension(_ctx): Extension<AuthContext>, ValidatedJson(body): ValidatedJson<PostTtsRequest>) -> Result<Response, AppError> {
     let voice = body.voice.unwrap_or_else(|| state.config.ai_tts_default_voice.clone());
-    let result = speaking_room::synthesize_turn_audio(state.ai_provider.as_ref(), &state.config.ai_speaking_room_tts_model, &body.text, &voice).await?;
+    let model = crate::services::ai_settings::resolve(&state.db, &state.config, "speaking_room_tts").await?.model_id;
+    let result = speaking_room::synthesize_turn_audio(state.ai_provider.as_ref(), &model, &body.text, &voice).await?;
     Ok(Response::builder().status(StatusCode::OK).header(header::CONTENT_TYPE, result.content_type).body(Body::from(result.bytes)).unwrap())
 }
 
@@ -59,6 +62,7 @@ pub async fn post_tts(State(state): State<Arc<AppState>>, Extension(_ctx): Exten
 pub async fn post_transcribe(State(state): State<Arc<AppState>>, Extension(_ctx): Extension<AuthContext>, ValidatedJson(body): ValidatedJson<PostTranscribeRequest>) -> Result<Json<serde_json::Value>, AppError> {
     let bytes = base64::engine::general_purpose::STANDARD.decode(&body.audio_base64).map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
     let mime_type = body.mime_type.as_deref().unwrap_or("audio/webm");
-    let result = state.ai_provider.transcribe(&bytes, mime_type, &state.config.ai_stt_model).await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    let model = crate::services::ai_settings::resolve(&state.db, &state.config, "stt").await?.model_id;
+    let result = state.ai_provider.transcribe(&bytes, mime_type, &model).await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
     Ok(Json(serde_json::json!({"transcript": result.text})))
 }

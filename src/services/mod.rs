@@ -1,4 +1,9 @@
 pub mod achievement;
+pub mod admin_audit;
+pub mod job_queue;
+pub mod ai_settings;
+pub mod metrics_rollup;
+pub mod admin_metrics;
 pub mod alm_generation;
 pub mod ad;
 pub mod ai_provider;

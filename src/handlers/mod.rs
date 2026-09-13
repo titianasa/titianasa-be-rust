@@ -1,4 +1,5 @@
 pub mod learning_profile;
+pub mod admin;
 pub mod ai;
 pub mod alm_generation;
 pub mod assessment;

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+use sqlx::PgPool;
 use tokio::sync::OnceCell;
 
 use crate::errors::AppError;
@@ -95,34 +96,25 @@ fn http_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(reqwest::Client::new)
 }
 
-/// The curated allowlist an author may pick from for text/quiz
-/// generation (`GET /ai/models`), deliberately NOT every model
-/// OpenRouter exposes — each entry here is a price/quality tradeoff
-/// worth naming for a non-technical author, not a raw model catalog.
-/// Text-generation models an author may pick, resolved against
-/// `AppState::text_ai_provider` (Vertex AI Gemini as of the GCP
-/// migration — see `services::vertex_ai_provider`). First entry is the
-/// default. Phase 38 (K2); GCP migration swapped the entries from
-/// OpenRouter/DeepSeek ids to Vertex Gemini ids.
-pub const AI_MODEL_OPTIONS: &[(&str, &str)] = &[("gemini-3.8-flash", "Cepat")];
-
-pub fn default_ai_model() -> &'static str {
-    AI_MODEL_OPTIONS[0].0
-}
-
-pub fn is_allowed_ai_model(model: &str) -> bool {
-    AI_MODEL_OPTIONS.iter().any(|(id, _)| *id == model)
-}
-
-/// A request's optional model override, validated against the
-/// allowlist — `None` falls through to the server's own configured
-/// default for that task (unaffected by this allowlist; the operator's
-/// own config isn't second-guessed, only what an author can request).
-pub fn resolve_ai_model<'a>(requested: Option<&'a str>, default: &'a str) -> Result<&'a str, AppError> {
+/// P40-003 — the author-facing allowlist (`GET /ai/models`) is now the
+/// AI model catalog's `text`-capable, enabled rows
+/// (`ai_settings::text_capable_models`), not a hardcoded const — an
+/// admin disabling a model in Pengaturan AI removes it from this list
+/// on the next call, no deploy needed. `role`'s resolved default
+/// (`ai_settings::resolve`) is what `requested: None` falls through to,
+/// same "operator's own config isn't second-guessed, only what an
+/// author can request" contract as before this ticket.
+pub async fn resolve_ai_model(pool: &PgPool, config: &crate::Config, role: &str, requested: Option<&str>) -> Result<String, AppError> {
     match requested {
-        None => Ok(default),
-        Some(model) if is_allowed_ai_model(model) => Ok(model),
-        Some(model) => Err(AppError::UnprocessableEntity("model_not_allowed", format!("model \"{model}\" tidak diizinkan"))),
+        None => Ok(crate::services::ai_settings::resolve(pool, config, role).await?.model_id),
+        Some(model) => {
+            let options = crate::services::ai_settings::text_capable_models(pool).await?;
+            if options.iter().any(|c| c.model_id == model) {
+                Ok(model.to_string())
+            } else {
+                Err(AppError::UnprocessableEntity("model_not_allowed", format!("model \"{model}\" tidak diizinkan")))
+            }
+        }
     }
 }
 
@@ -189,26 +181,23 @@ fn capped_max_tokens(model_max: Option<i64>, fallback: i64) -> i64 {
     model_max.map_or(fallback, |model_max| model_max.min(fallback))
 }
 
-// Vertex's models live in a different id namespace than OpenRouter's
-// catalogue, so the lookup below can never resolve one: every Vertex
-// call has been falling through to the caller's fallback with no real
-// ceiling behind it since the GCP migration. These are the limits
-// Vertex itself enforces — asking `gemini-3.8-flash` for more is a hard
-// 400: "supported range is from 1 (inclusive) to 65537 (exclusive)".
-const VERTEX_MODEL_MAX_TOKENS: &[(&str, i64)] = &[("gemini-3.8-flash", 65_536)];
-
-fn vertex_model_max_tokens(model: &str) -> Option<i64> {
-    VERTEX_MODEL_MAX_TOKENS.iter().find(|(id, _)| *id == model).map(|(_, max)| *max)
-}
-
-// Falls back to `fallback` if the model isn't in OpenRouter's list or the
-// lookup itself fails — never fails the caller's generation attempt.
-pub async fn resolve_max_tokens(model: &str, fallback: i64) -> i64 {
-    // A Vertex model's ceiling is known right here, so there is nothing
-    // to wait on a network catalogue for — and the catalogue could not
-    // answer for this id anyway.
-    if let Some(model_max) = vertex_model_max_tokens(model) {
-        return capped_max_tokens(Some(model_max), fallback);
+// P40-003 — a model's ceiling now comes from `ai_model_catalog.max_output_tokens`
+// (`ai_settings::model_max_tokens`, in-process cached same as this
+// file's own OpenRouter lookup) instead of a hardcoded Vertex-only
+// const. This is what actually fixed the bug the old const's own doc
+// comment described (Vertex ids never resolving against OpenRouter's
+// catalogue) — the seed migration gives `gemini-3.8-flash` the exact
+// same 65,536 ceiling the old const did, so behavior is unchanged
+// until an admin edits the catalog.
+//
+// Falls back to `fallback` if the model isn't in the catalog OR
+// OpenRouter's list, or any lookup fails — never fails the caller's
+// generation attempt.
+pub async fn resolve_max_tokens(pool: &PgPool, model: &str, fallback: i64) -> i64 {
+    match crate::services::ai_settings::model_max_tokens(pool, model).await {
+        Ok(Some(model_max)) => return capped_max_tokens(Some(model_max), fallback),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(error = ?e, "resolveMaxTokens: catalog lookup failed, falling through to OpenRouter"),
     }
     match MODEL_MAX_TOKENS.get_or_try_init(fetch_model_max_tokens).await {
         Ok(map) => capped_max_tokens(map.get(model).copied(), fallback),
@@ -216,6 +205,52 @@ pub async fn resolve_max_tokens(model: &str, fallback: i64) -> i64 {
             tracing::warn!(error = ?e, "resolveMaxTokens: OpenRouter /models lookup failed, using fallback");
             fallback
         }
+    }
+}
+
+/// P40-003 — a role's `ResolvedModel.fallback_model_id` (Pengaturan AI):
+/// tries `resolved.model_id` first; if that fails AND a fallback is
+/// configured, retries ONCE against the fallback model. Returns which
+/// model id actually produced the result, so a caller's `ai_tasks.model`
+/// records reality (ADR-0013/ADR-0014: "ai_tasks.model mencatat model
+/// yang benar-benar dipakai") instead of always the configured primary.
+///
+/// Deliberately generic over the request rather than a specific
+/// generation function — every one of this codebase's ~16 generation
+/// call sites already has its OWN retry-then-validate shape (JSON
+/// parsing, empty-reply checks, ...), so this is infrastructure a call
+/// site opts into around its EXISTING primary-model attempt, not a
+/// replacement for it. Not yet wired into a live call site in this
+/// ticket — the DoD itself only requires resolving the CONFIGURED
+/// model, not proving the failure path end-to-end; wiring this into a
+/// generator is a following ticket's job, one call site at a time.
+///
+/// No fallback configured → behaves exactly like calling
+/// `ai.generate()` directly: the primary's own error is returned
+/// untouched, `resolved.model_id` reported as what was "used" (it's the
+/// only one that was tried).
+pub async fn generate_with_fallback(
+    ai: &dyn AIProvider,
+    resolved: &crate::services::ai_settings::ResolvedModel,
+    request: GenerationRequest,
+) -> (Result<GenerationResponse, AIProviderError>, String) {
+    let primary_request = GenerationRequest { model: resolved.model_id.clone(), ..request.clone() };
+    let primary_result = ai.generate(primary_request).await;
+    if primary_result.is_ok() {
+        return (primary_result, resolved.model_id.clone());
+    }
+    let Some(fallback_id) = &resolved.fallback_model_id else {
+        return (primary_result, resolved.model_id.clone());
+    };
+    tracing::warn!(primary_model = %resolved.model_id, fallback_model = %fallback_id, "primary model failed, trying fallback");
+    let fallback_request = GenerationRequest { model: fallback_id.clone(), ..request };
+    match ai.generate(fallback_request).await {
+        Ok(resp) => (Ok(resp), fallback_id.clone()),
+        // Both failed — report the PRIMARY's error (the one the caller
+        // configured as their real choice), not the fallback's, same
+        // "report the meaningful failure" convention this codebase's
+        // existing 2-attempt retry loops already follow.
+        Err(_) => (primary_result, resolved.model_id.clone()),
     }
 }
 
@@ -524,6 +559,86 @@ impl AIProvider for FlakyThenSuccessProvider {
 mod tests {
     use super::*;
 
+    // Fails when `req.model` matches `fail_for`, succeeds (echoing the
+    // model id back as the response text, so a test can tell which
+    // model actually answered) otherwise — `generate_with_fallback`'s
+    // own tests need per-MODEL behavior, unlike `FakeAIProvider`'s
+    // single fixed outcome.
+    struct ModelAwareProvider {
+        fail_for: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl AIProvider for ModelAwareProvider {
+        async fn generate(&self, req: GenerationRequest) -> Result<GenerationResponse, AIProviderError> {
+            if req.model == self.fail_for {
+                Err(AIProviderError(format!("{} is down", req.model)))
+            } else {
+                Ok(GenerationResponse { text: req.model, tokens_used: Some(1) })
+            }
+        }
+        async fn transcribe(&self, _audio: &[u8], _mime_type: &str, _model: &str) -> Result<TranscriptionResult, AIProviderError> {
+            unimplemented!()
+        }
+        async fn synthesize_speech(&self, _text: &str, _voice: &str, _model: &str) -> Result<SpeechResult, AIProviderError> {
+            unimplemented!()
+        }
+    }
+
+    fn fallback_test_request() -> GenerationRequest {
+        GenerationRequest { model: String::new(), system_prompt: "sp".into(), user_prompt: "up".into(), temperature: 0.0, max_tokens: 100, image_url: None, json_mode: false }
+    }
+
+    #[tokio::test]
+    async fn primary_success_never_touches_the_fallback() {
+        let ai = ModelAwareProvider { fail_for: "never-used" };
+        let resolved = crate::services::ai_settings::ResolvedModel { model_id: "primary".into(), fallback_model_id: Some("fallback".into()), temperature: None, max_tokens: None };
+        let (result, used) = generate_with_fallback(&ai, &resolved, fallback_test_request()).await;
+        assert_eq!(result.unwrap().text, "primary");
+        assert_eq!(used, "primary", "ai_tasks.model must record the model that actually answered");
+    }
+
+    #[tokio::test]
+    async fn primary_failure_falls_through_to_the_fallback_and_reports_it_as_used() {
+        let ai = ModelAwareProvider { fail_for: "primary" };
+        let resolved = crate::services::ai_settings::ResolvedModel { model_id: "primary".into(), fallback_model_id: Some("fallback".into()), temperature: None, max_tokens: None };
+        let (result, used) = generate_with_fallback(&ai, &resolved, fallback_test_request()).await;
+        assert_eq!(result.unwrap().text, "fallback");
+        assert_eq!(used, "fallback");
+    }
+
+    #[tokio::test]
+    async fn no_fallback_configured_just_returns_the_primarys_own_error() {
+        let ai = ModelAwareProvider { fail_for: "primary" };
+        let resolved = crate::services::ai_settings::ResolvedModel { model_id: "primary".into(), fallback_model_id: None, temperature: None, max_tokens: None };
+        let (result, used) = generate_with_fallback(&ai, &resolved, fallback_test_request()).await;
+        assert!(result.is_err());
+        assert_eq!(used, "primary");
+    }
+
+    struct AlwaysFails;
+    #[async_trait::async_trait]
+    impl AIProvider for AlwaysFails {
+        async fn generate(&self, req: GenerationRequest) -> Result<GenerationResponse, AIProviderError> {
+            Err(AIProviderError(format!("{} is down", req.model)))
+        }
+        async fn transcribe(&self, _audio: &[u8], _mime_type: &str, _model: &str) -> Result<TranscriptionResult, AIProviderError> {
+            unimplemented!()
+        }
+        async fn synthesize_speech(&self, _text: &str, _voice: &str, _model: &str) -> Result<SpeechResult, AIProviderError> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn both_primary_and_fallback_failing_reports_the_primarys_error() {
+        let ai = AlwaysFails;
+        let resolved = crate::services::ai_settings::ResolvedModel { model_id: "primary".into(), fallback_model_id: Some("fallback".into()), temperature: None, max_tokens: None };
+        let (result, used) = generate_with_fallback(&ai, &resolved, fallback_test_request()).await;
+        assert_eq!(result.unwrap_err().0, "primary is down", "the PRIMARY's error is what's surfaced, not the fallback's");
+        assert_eq!(used, "primary");
+    }
+
     #[test]
     fn capped_max_tokens_prefers_the_smaller_of_the_two() {
         // The model can return far more than this task ever needs —
@@ -536,21 +651,16 @@ mod tests {
         assert_eq!(capped_max_tokens(None, 16_000), 16_000);
     }
 
-    // The number here is not a guess: Vertex rejects anything higher for
-    // this model with "supported range is from 1 (inclusive) to 65537
-    // (exclusive)", and 65_536 is accepted.
+    // P40-003 — the ceiling itself now lives in `ai_model_catalog`
+    // (seed migration gives `gemini-3.8-flash` 65_536, proven against a
+    // real DB by `ai_settings_test.rs::resolve_max_tokens_...`), not a
+    // const this file can unit-test in isolation. What's still pure and
+    // worth a plain unit test is the CLAMPING math itself — Vertex
+    // rejects anything higher than 65_536 for this model with
+    // "supported range is from 1 (inclusive) to 65537 (exclusive)".
     #[test]
-    fn the_vertex_ceiling_is_known_locally_rather_than_looked_up() {
-        assert_eq!(vertex_model_max_tokens("gemini-3.8-flash"), Some(65_536));
-        // Anything not a Vertex model still goes to the catalogue path.
-        assert_eq!(vertex_model_max_tokens("deepseek/deepseek-v4.1-flash"), None);
-    }
-
-    #[test]
-    fn an_article_asking_for_the_whole_budget_is_clamped_to_what_vertex_allows() {
-        // Article generation asks for 65_536 deliberately; a caller must
-        // never end up requesting more than Vertex will accept.
-        let ceiling = vertex_model_max_tokens("gemini-3.8-flash");
+    fn an_article_asking_for_the_whole_budget_is_clamped_to_the_models_ceiling() {
+        let ceiling = Some(65_536);
         assert_eq!(capped_max_tokens(ceiling, 65_536), 65_536);
         assert_eq!(capped_max_tokens(ceiling, 1_000_000), 65_536);
     }

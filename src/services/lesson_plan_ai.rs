@@ -400,7 +400,7 @@ pub async fn generate_plan(pool: &PgPool, ai: &dyn AIProvider, model: &str, ctx:
     // generation this platform makes — several sections, each with its
     // own explanation blocks. Ask for the model's whole budget;
     // resolve_max_tokens still clamps it to what the model allows.
-    let max_tokens = resolve_max_tokens(model, 65_536).await;
+    let max_tokens = resolve_max_tokens(pool, model, 65_536).await;
     let request = GenerationRequest { model: model.to_string(), system_prompt, user_prompt, temperature: 0.5, max_tokens, image_url: None, json_mode: false };
 
     // One retry — a transient provider failure or a reply with no
@@ -626,7 +626,7 @@ Daftar bagian dalam modul ini:\n",
     user.push_str(&format!("Kembalikan HANYA dua blok ({META_OPEN}…{META_CLOSE} dan {CONTENT_OPEN}…{CONTENT_CLOSE})."));
 
     let ai_task_id = Uuid::new_v4();
-    let max_tokens = resolve_max_tokens(model, 16_000).await;
+    let max_tokens = resolve_max_tokens(pool, model, 16_000).await;
     let request = GenerationRequest { model: model.to_string(), system_prompt: edit_system_prompt(), user_prompt: user, temperature: 0.4, max_tokens, image_url: None, json_mode: false };
 
     // One retry, same reasoning as generate_plan above: a stray provider
@@ -753,7 +753,7 @@ pub async fn translate_plan(pool: &PgPool, ai: &dyn AIProvider, model: &str, ctx
     }
 
     let ai_task_id = Uuid::new_v4();
-    let max_tokens = resolve_max_tokens(model, 12_000).await;
+    let max_tokens = resolve_max_tokens(pool, model, 12_000).await;
     // Sections are independent, so they go out in parallel — a
     // 10-section module takes about as long as its longest section.
     let (header, sections) = tokio::join!(

@@ -765,7 +765,7 @@ pub async fn generate_quiz_group(
     // question plus a flat 2000 for that shared context covers real
     // observed output sizes with real headroom to spare; capped well
     // under what gemini-3.8-flash actually supports.
-    let max_tokens = resolve_max_tokens(model, ((900 * requested) + 2000).clamp(3000, 32_000)).await;
+    let max_tokens = resolve_max_tokens(pool, model, ((900 * requested) + 2000).clamp(3000, 32_000)).await;
     let request = GenerationRequest {
         model: model.to_string(),
         system_prompt,
@@ -1027,7 +1027,7 @@ pub async fn suggest_group_types(pool: &PgPool, ai: &dyn AIProvider, ctx: &AuthC
     let truncated: String = document_text.chars().take(SUGGEST_DOCUMENT_CHAR_LIMIT).collect();
 
     let ai_task_id = Uuid::new_v4();
-    let max_tokens = resolve_max_tokens(model, 6000).await;
+    let max_tokens = resolve_max_tokens(pool, model, 6000).await;
     let request = GenerationRequest {
         model: model.to_string(),
         system_prompt: suggest_group_types_system_prompt(),

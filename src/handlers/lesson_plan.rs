@@ -19,8 +19,8 @@ pub async fn post_generate_lesson_plan(
     // Cloned rather than borrowed from `body`: `body` moves whole into
     // `generate_plan` below, so `model` can't still be borrowing from it.
     let requested_model = body.model.clone();
-    let model = resolve_ai_model(requested_model.as_deref(), &state.config.ai_lesson_generation_model)?;
-    Ok(Json(lesson_plan_ai::generate_plan(&state.db, state.text_ai_provider.as_ref(), model, &ctx, body).await?))
+    let model = resolve_ai_model(&state.db, &state.config, "lesson_generation", requested_model.as_deref()).await?;
+    Ok(Json(lesson_plan_ai::generate_plan(&state.db, state.text_ai_provider.as_ref(), &model, &ctx, body).await?))
 }
 
 // POST /ai/edit-lesson-section — one section rewritten (or written from
@@ -30,7 +30,8 @@ pub async fn post_edit_lesson_section(
     Extension(ctx): Extension<AuthContext>,
     ValidatedJson(body): ValidatedJson<EditLessonSectionRequest>,
 ) -> Result<Json<EditSectionResponse>, AppError> {
-    Ok(Json(lesson_plan_ai::edit_section(&state.db, state.text_ai_provider.as_ref(), &state.config.ai_lesson_generation_model, &ctx, body).await?))
+    let model = crate::services::ai_settings::resolve(&state.db, &state.config, "lesson_generation").await?.model_id;
+    Ok(Json(lesson_plan_ai::edit_section(&state.db, state.text_ai_provider.as_ref(), &model, &ctx, body).await?))
 }
 
 // POST /ai/translate-lesson-plan — the learner's chosen reading language.
@@ -39,5 +40,6 @@ pub async fn post_translate_lesson_plan(
     Extension(ctx): Extension<AuthContext>,
     ValidatedJson(body): ValidatedJson<TranslateLessonPlanRequest>,
 ) -> Result<Json<TranslatePlanResponse>, AppError> {
-    Ok(Json(lesson_plan_ai::translate_plan(&state.db, state.text_ai_provider.as_ref(), &state.config.ai_lesson_generation_model, &ctx, body).await?))
+    let model = crate::services::ai_settings::resolve(&state.db, &state.config, "lesson_generation").await?.model_id;
+    Ok(Json(lesson_plan_ai::translate_plan(&state.db, state.text_ai_provider.as_ref(), &model, &ctx, body).await?))
 }

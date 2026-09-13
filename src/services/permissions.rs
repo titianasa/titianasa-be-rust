@@ -31,6 +31,13 @@ pub enum Resource {
     // Phase 36 — "Periode" (batch/semester), pure org-admin territory:
     // a teacher creates classes, not academic terms.
     Period,
+    // P40-001 (ADR-0014) — `/admin`, cross-organization by design
+    // (unlike every other resource above, which is org-scoped or global
+    // content). `is_admin_pusat_role` below is the ONE place role
+    // eligibility is decided, so `pusat_kurikulum`/`pusat_ai`/
+    // `pusat_bisnis`/`pusat_viewer` (ADR-0014 §1, not created yet) only
+    // ever need to be added there, not hunted down across a match arm.
+    AdminPusat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +49,18 @@ pub enum Action {
     SubmitReview,
     Publish,
     Review,
+    // P40-001 — any admin-pusat write (approve/reject an AI proposal,
+    // change model settings, roll back a version, ...). Every one of
+    // these must go through `admin_audit::record` at the call site.
+    Manage,
+}
+
+/// The one gate for every Admin Pusat permission check below. Today
+/// only `platform_admin` — ADR-0014 §1's narrower `pusat_*` roles don't
+/// exist in the DB yet, so adding one later is a one-line change here,
+/// not a hunt through every `(AdminPusat, _)` match arm.
+fn is_admin_pusat_role(role: Option<&str>) -> bool {
+    matches!(role, Some("platform_admin"))
 }
 
 // The permission matrix itself, as a plain bool — split out from
@@ -117,6 +136,7 @@ pub fn is_allowed(role: Option<&str>, resource: Resource, action: Action) -> boo
         (Class, Create) | (Class, View) => {
             matches!(role, "platform_admin" | "org_owner" | "academic_director" | "teacher" | "tutor")
         }
+        (AdminPusat, View) | (AdminPusat, Manage) => is_admin_pusat_role(Some(role)),
         _ => false,
     }
 }

@@ -125,18 +125,25 @@ pub async fn run_speaking_evaluation(
         return SpeakingEvaluationResult { transcript: None, evaluation: None };
     };
 
-    let transcript = match stt_ai.transcribe(audio_bytes, audio_content_type, &config.ai_stt_model).await {
+    let Ok(stt_model) = crate::services::ai_settings::resolve(pool, config, "stt").await else {
+        return SpeakingEvaluationResult { transcript: None, evaluation: None };
+    };
+    let Ok(eval_model) = crate::services::ai_settings::resolve(pool, config, "speaking_evaluation").await else {
+        return SpeakingEvaluationResult { transcript: None, evaluation: None };
+    };
+
+    let transcript = match stt_ai.transcribe(audio_bytes, audio_content_type, &stt_model.model_id).await {
         Ok(t) => t.text,
         Err(e) => {
             tracing::warn!(error = ?e, "speaking evaluation transcription failed");
-            let _ = ai_task::insert_failed(pool, ai_task_id, user_id, "speaking_evaluation", PROVIDER, &config.ai_speaking_evaluation_model, SPEAKING_EVALUATION_PROMPT_ID).await;
+            let _ = ai_task::insert_failed(pool, ai_task_id, user_id, "speaking_evaluation", PROVIDER, &eval_model.model_id, SPEAKING_EVALUATION_PROMPT_ID).await;
             return SpeakingEvaluationResult { transcript: None, evaluation: None };
         }
     };
 
     let (system_prompt, user_prompt) = speaking_evaluation_prompt(&transcript);
-    let model = &config.ai_speaking_evaluation_model;
-    let max_tokens = resolve_max_tokens(model, 1024).await;
+    let model = &eval_model.model_id;
+    let max_tokens = resolve_max_tokens(pool, model, 1024).await;
     let generation = match text_ai.generate(GenerationRequest { model: model.clone(), system_prompt, user_prompt, temperature: 0.3, max_tokens, image_url: None, json_mode: true }).await {
         Ok(g) => g,
         Err(e) => {

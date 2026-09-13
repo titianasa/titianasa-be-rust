@@ -370,9 +370,10 @@ pub async fn get_item_version(
 // bytes, not JSON, matching speaking_room.rs's post_tts precedent.
 pub async fn get_speaking_prompt_audio(State(state): State<Arc<AppState>>, Extension(ctx): Extension<AuthContext>, Path(id): Path<Uuid>) -> Result<Response, AppError> {
     let prompt = module_item::get_speaking_prompt_text(&state.db, &ctx, id).await?;
+    let model = crate::services::ai_settings::resolve(&state.db, &state.config, "tts").await?.model_id;
     let result = state
         .ai_provider
-        .synthesize_speech(&prompt.text, &state.config.ai_tts_default_voice, &state.config.ai_tts_model)
+        .synthesize_speech(&prompt.text, &state.config.ai_tts_default_voice, &model)
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
     Ok(Response::builder().status(StatusCode::OK).header(header::CONTENT_TYPE, result.content_type).body(Body::from(result.bytes)).unwrap())

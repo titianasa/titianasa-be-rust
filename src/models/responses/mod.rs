@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod assessment;
 pub mod auth;
 pub mod concept;

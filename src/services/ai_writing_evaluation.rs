@@ -115,7 +115,7 @@ pub async fn run_writing_evaluation(pool: &PgPool, ai: &dyn AIProvider, model: &
     let ai_task_id = Uuid::new_v4();
     let rubric = ensure_writing_rubric(pool).await.ok()?;
     let (system_prompt, user_prompt) = writing_evaluation_prompt(answer_text);
-    let max_tokens = resolve_max_tokens(model, 1024).await;
+    let max_tokens = resolve_max_tokens(pool, model, 1024).await;
 
     let generation = match ai.generate(GenerationRequest { model: model.to_string(), system_prompt, user_prompt, temperature: 0.3, max_tokens, image_url: None, json_mode: true }).await {
         Ok(g) => g,

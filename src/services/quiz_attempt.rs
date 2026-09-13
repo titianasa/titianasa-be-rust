@@ -289,10 +289,11 @@ async fn evaluate_with_rubric(
             if text.trim().is_empty() {
                 return Ok(None);
             }
+            let model = crate::services::ai_settings::resolve(pool, config, "writing_evaluation").await?.model_id;
             Ok(ai_writing_evaluation::run_writing_evaluation(
                 pool,
                 text_ai,
-                &config.ai_writing_evaluation_model,
+                &model,
                 ctx.user_id,
                 attempt_id,
                 text,
