@@ -238,7 +238,7 @@ pub async fn generate_lesson(pool: &PgPool, ctx: &AuthContext, ai: &dyn AIProvid
 
     let (system_prompt, user_prompt) = lesson_generation_prompt(&bp, &subject_name);
     let max_tokens = resolve_max_tokens(pool, model, ARTICLE_MAX_OUTPUT_TOKENS).await;
-    let request = GenerationRequest { model: model.to_string(), system_prompt, user_prompt, temperature: 0.4, max_tokens, image_url: None, json_mode: false };
+    let request = GenerationRequest { model: model.to_string(), system_prompt, user_prompt, temperature: 0.4, max_tokens, image_url: None, json_mode: false, thinking_budget: None, allow_partial: false };
 
     let ai_task_id = Uuid::new_v4();
 
@@ -404,7 +404,7 @@ pub async fn generate_questions(pool: &PgPool, ctx: &AuthContext, ai: &dyn AIPro
 
     let (system_prompt, user_prompt) = question_generation_prompt(&bp);
     let max_tokens = resolve_max_tokens(pool, model, (400 * bp.count).max(512)).await;
-    let request = GenerationRequest { model: model.to_string(), system_prompt, user_prompt, temperature: 0.4, max_tokens, image_url: None, json_mode: false };
+    let request = GenerationRequest { model: model.to_string(), system_prompt, user_prompt, temperature: 0.4, max_tokens, image_url: None, json_mode: false, thinking_budget: None, allow_partial: false };
 
     let ai_task_id = Uuid::new_v4();
 

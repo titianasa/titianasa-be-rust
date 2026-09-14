@@ -17,6 +17,7 @@
 
 mod admin_audit_test;
 mod admin_metrics_test;
+mod admin_participants_test;
 mod ai_content_test;
 mod ai_gateway_test;
 mod ai_settings_test;
@@ -25,6 +26,7 @@ mod attempt_submission_test;
 mod attendance_test;
 mod auth_test;
 mod client_events_test;
+mod content_factory_test;
 mod drive_test;
 mod economy_test;
 mod gamification_test;
@@ -45,8 +47,10 @@ mod quiz_draft_gate_test;
 mod quiz_generation_concurrency_test;
 mod quiz_learning_events_test;
 mod quiz_max_attempts_test;
+mod quiz_paper_test;
 mod quiz_parse_raw_test;
 mod quiz_suggest_group_types_test;
+mod section_checkpoint_test;
 mod user_data_consent_test;
 
 /// The guard for the comment above: a `*_test.rs` dropped into this

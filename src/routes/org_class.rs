@@ -12,6 +12,7 @@ pub fn protected_routes() -> Router<Arc<AppState>> {
         .route("/classes", get(handlers::org_class::get_classes).post(handlers::org_class::post_class))
         .route("/classes/{id}", get(handlers::org_class::get_class).patch(handlers::org_class::patch_class))
         .route("/classes/{id}/members", post(handlers::org_class::post_class_member))
+        .route("/classes/{id}/learning-heatmap", get(handlers::learning_heatmap::get_class_heatmap))
         .route("/classes/{id}/members/{student_id}", axum::routing::delete(handlers::org_class::delete_class_member))
         // Phase 35 — sessions + attendance.
         .route("/classes/{id}/sessions", get(handlers::org_class_session::get_sessions).post(handlers::org_class_session::post_session))

@@ -17,6 +17,19 @@ pub struct GenerationRequest {
     pub user_prompt: String,
     pub temperature: f64,
     pub max_tokens: i64,
+    /// Gemini "thinking" tokens are billed against `max_tokens`, so a
+    /// generous-looking budget can still be spent entirely on reasoning
+    /// and return `finishReason: MAX_TOKENS` with no answer at all (seen
+    /// on a 3-question quiz batch at 4700). `Some(n)` caps it; `None`
+    /// leaves the model's default. Providers that have no such knob
+    /// ignore it.
+    pub thinking_budget: Option<i64>,
+    /// The caller can use a reply the output ceiling cut short, and will
+    /// continue it itself (lesson_plan_ai::generate_plan keeps every
+    /// section that closed and asks only for the rest). Everyone else
+    /// keeps the old contract: a cut-off reply is an error, because
+    /// half a JSON array is worse than no answer.
+    pub allow_partial: bool,
     // P2-015 (OCR-to-Question) — a signed, publicly-fetchable URL, not
     // raw bytes; unused by R8 callers but kept on the shared request
     // shape for whichever later phase ports OCR.
@@ -35,6 +48,9 @@ pub struct GenerationRequest {
 pub struct GenerationResponse {
     pub text: String,
     pub tokens_used: Option<i64>,
+    /// The model stopped at its output ceiling (only ever true when the
+    /// request set `allow_partial`).
+    pub truncated: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -351,7 +367,7 @@ impl AIProvider for DeepSeekProvider {
         let text = parsed.choices.into_iter().next().and_then(|c| c.message.content);
         let text = text.ok_or_else(|| AIProviderError("empty or null completion content in provider response".to_string()))?;
 
-        Ok(GenerationResponse { text, tokens_used: parsed.usage.map(|u| u.total_tokens) })
+        Ok(GenerationResponse { text, tokens_used: parsed.usage.map(|u| u.total_tokens), truncated: false })
     }
 
     // ADR-0010 — OpenRouter's transcription endpoint, OpenAI-compatible
@@ -496,7 +512,7 @@ impl FakeAIProvider {
 impl AIProvider for FakeAIProvider {
     async fn generate(&self, _req: GenerationRequest) -> Result<GenerationResponse, AIProviderError> {
         match &self.generate_result {
-            FakeResult::Ok(text) => Ok(GenerationResponse { text: text.clone(), tokens_used: Some(42) }),
+            FakeResult::Ok(text) => Ok(GenerationResponse { text: text.clone(), tokens_used: Some(42), truncated: false }),
             FakeResult::Err(msg) => Err(AIProviderError(msg.clone())),
         }
     }
@@ -542,8 +558,46 @@ impl AIProvider for FlakyThenSuccessProvider {
         if call_index < self.fail_times {
             Err(AIProviderError("simulated transient provider failure".to_string()))
         } else {
-            Ok(GenerationResponse { text: self.success_text.clone(), tokens_used: Some(7) })
+            Ok(GenerationResponse { text: self.success_text.clone(), tokens_used: Some(7), truncated: false })
         }
+    }
+
+    async fn transcribe(&self, _audio: &[u8], _mime_type: &str, _model: &str) -> Result<TranscriptionResult, AIProviderError> {
+        Ok(TranscriptionResult { text: "unused".to_string() })
+    }
+
+    async fn synthesize_speech(&self, _text: &str, _voice: &str, _model: &str) -> Result<SpeechResult, AIProviderError> {
+        Ok(SpeechResult { bytes: vec![], content_type: "audio/mpeg".to_string() })
+    }
+}
+
+/// Answers each call with the next reply in `replies` (the last one
+/// repeats) and keeps every user prompt it was sent, so a test can
+/// check both what came back and what a follow-up call ASKED for — the
+/// continuation of a cut-off article is only correct if it asks for the
+/// missing sections and not the whole article again.
+pub struct ScriptedProvider {
+    replies: Vec<String>,
+    calls: std::sync::Mutex<Vec<String>>,
+}
+
+impl ScriptedProvider {
+    pub fn new(replies: Vec<String>) -> Self {
+        Self { replies, calls: std::sync::Mutex::new(Vec::new()) }
+    }
+
+    pub fn prompts(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl AIProvider for ScriptedProvider {
+    async fn generate(&self, req: GenerationRequest) -> Result<GenerationResponse, AIProviderError> {
+        let mut calls = self.calls.lock().unwrap();
+        let index = calls.len().min(self.replies.len().saturating_sub(1));
+        calls.push(req.user_prompt);
+        Ok(GenerationResponse { text: self.replies[index].clone(), tokens_used: Some(10), truncated: false })
     }
 
     async fn transcribe(&self, _audio: &[u8], _mime_type: &str, _model: &str) -> Result<TranscriptionResult, AIProviderError> {
@@ -574,7 +628,7 @@ mod tests {
             if req.model == self.fail_for {
                 Err(AIProviderError(format!("{} is down", req.model)))
             } else {
-                Ok(GenerationResponse { text: req.model, tokens_used: Some(1) })
+                Ok(GenerationResponse { text: req.model, tokens_used: Some(1), truncated: false })
             }
         }
         async fn transcribe(&self, _audio: &[u8], _mime_type: &str, _model: &str) -> Result<TranscriptionResult, AIProviderError> {
@@ -586,7 +640,7 @@ mod tests {
     }
 
     fn fallback_test_request() -> GenerationRequest {
-        GenerationRequest { model: String::new(), system_prompt: "sp".into(), user_prompt: "up".into(), temperature: 0.0, max_tokens: 100, image_url: None, json_mode: false }
+        GenerationRequest { model: String::new(), system_prompt: "sp".into(), user_prompt: "up".into(), temperature: 0.0, max_tokens: 100, image_url: None, json_mode: false, thinking_budget: None, allow_partial: false }
     }
 
     #[tokio::test]

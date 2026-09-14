@@ -106,6 +106,9 @@ pub struct ModuleItemDetailResponse {
     /// Migration 0045 — "Aturan Akses & Guard" and "Attendance Guard".
     pub guard_config: Option<serde_json::Value>,
     pub attendance_guard: Option<serde_json::Value>,
+    /// Whether this viewer may open /belajar/{id}/preview (author,
+    /// reviewer, admin, or a collaborator shared onto the item).
+    pub can_preview: bool,
 }
 
 #[derive(Debug, serde::Serialize)]

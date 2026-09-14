@@ -21,6 +21,7 @@ async fn main() -> anyhow::Result<()> {
     // job belongs in Phase 40's job queue; this is what exists before
     // that queue does.
     titian_backend_rust::services::learning_event::ensure_current_partitions(&state.db).await?;
+    titian_backend_rust::services::learning_event::ensure_month_partitions(&state.db, "question_answer_facts").await?;
     // P39-007 — drops any raw-event partition past its 24-month
     // retention window. Same "boot-time safety net until Phase 40 has a
     // real scheduler" reasoning as the line above.
@@ -33,7 +34,9 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = TcpListener::bind(&state.config.bind_addr).await?;
     tracing::info!("titian-backend-rust listening on {}", state.config.bind_addr);
-    axum::serve(listener, app)
+    // Admin Pusat "Peserta" (presence/login tracking, services/request_meta.rs)
+    // needs the real TCP peer address on every request.
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 

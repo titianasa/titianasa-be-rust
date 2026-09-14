@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use titian_backend_rust::{
     routes,
-    services::{ai_provider::FlakyThenSuccessProvider, token},
+    services::{ai_provider::{FlakyThenSuccessProvider, ScriptedProvider}, token},
     state::AppState,
     Config,
 };
@@ -226,4 +226,49 @@ async fn lesson_plan_generation_rejects_a_model_outside_the_allowlist(pool: PgPo
 
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
     assert_eq!(body["error"], "model_not_allowed");
+}
+
+fn section(title: &str) -> String {
+    format!("<<<SECTION>>>\n{{\"title\": \"{title}\", \"goal\": \"-\", \"minutes\": 5}}\n<<<CONTENT>>>\nIsi {title}.\n<<<END_SECTION>>>\n")
+}
+
+#[sqlx::test]
+async fn an_article_cut_off_by_the_output_ceiling_is_continued_not_regenerated(pool: PgPool) {
+    // A bab long enough to exceed the model's output limit. The first
+    // reply closes two sections and stops mid-third (what MAX_TOKENS
+    // looks like after the provider hands back partial text); the
+    // second reply writes the rest. Before continuation, the whole
+    // reply was thrown away and re-asked — hitting the same ceiling.
+    let (_dev_uid, dev_token) = insert_user_with_role(&pool, "continue-dev@example.com", "curriculum_developer").await;
+    let first = format!(
+        "<<<PLAN>>>\n{{\"title\": \"Pecahan\", \"topic\": \"Pecahan\", \"level\": \"SD\"}}\n<<<END_PLAN>>>\n{}{}<<<SECTION>>>\n{{\"title\": \"Bagian Tiga\"}}\n<<<CONTENT>>>\nKalimat yang terpotong di teng",
+        section("Bagian Satu"),
+        section("Bagian Dua"),
+    );
+    let second = format!("{}{}", section("Bagian Tiga"), section("Bagian Empat"));
+    let ai = Arc::new(ScriptedProvider::new(vec![first, second]));
+    let app = build_app_with_ai(pool.clone(), ai.clone());
+    let module_id = create_module(app.clone(), &dev_token, &pool, "CONTINUE").await;
+    let item_id = create_article_item(app.clone(), &dev_token, &module_id).await;
+
+    let (status, body) = send(
+        app,
+        Method::POST,
+        "/ai/generate-lesson-plan",
+        &dev_token,
+        json!({"item_id": item_id, "topic": "Pecahan", "duration_minutes": 30, "language": "id", "section_count": 4}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let titles: Vec<&str> = body["lesson_plan"]["sections"].as_array().unwrap().iter().map(|s| s["title"].as_str().unwrap()).collect();
+    assert_eq!(titles, vec!["Bagian Satu", "Bagian Dua", "Bagian Tiga", "Bagian Empat"], "the cut-off fragment is dropped, not duplicated");
+    assert_eq!(body["lesson_plan"]["title"], "Pecahan", "plan meta comes from the first pass");
+
+    let prompts = ai.prompts();
+    assert_eq!(prompts.len(), 2, "one continuation, not a regeneration loop");
+    assert!(prompts[1].contains("LANJUTAN"), "{}", prompts[1]);
+    assert!(prompts[1].contains("1. Bagian Satu") && prompts[1].contains("2. Bagian Dua"));
+    assert!(prompts[1].contains("Tulis bagian 3 sampai 4"), "{}", prompts[1]);
+    assert!(!prompts[1].contains("Isi Bagian Satu"), "written sections are named, never resent");
 }

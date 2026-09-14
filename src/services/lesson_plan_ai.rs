@@ -213,6 +213,7 @@ pub fn parse_generated_plan(text: &str) -> LessonPlan {
             minutes: meta_minutes(&section_meta),
             goal: meta_str(&section_meta, "goal"),
             content: lesson_plan::sanitize_generated(content),
+            checkpoint: None,
         });
         rest = next;
     }
@@ -231,6 +232,42 @@ pub fn parse_generated_plan(text: &str) -> LessonPlan {
 /// exactly what let a reply cut off mid-sentence through as a complete
 /// one-section module. Generation holds the stricter bar: a cut-off
 /// reply is retried, never saved.
+/// The part of a reply whose sections all closed.
+///
+/// A reply stopped by the model's output ceiling ends mid-section. That
+/// fragment is unusable, but everything before the last
+/// `<<<END_SECTION>>>` is finished work — and throwing it away is what
+/// made a long article impossible rather than merely expensive: the
+/// retry asked for the whole thing again, hit the same ceiling, and the
+/// author got nothing for twice the tokens.
+fn complete_prefix(text: &str) -> &str {
+    match text.rfind(SECTION_CLOSE) {
+        Some(end) => &text[..end + SECTION_CLOSE.len()],
+        None => "",
+    }
+}
+
+/// What to send for the REST of an article. The sections already
+/// written are named, not repeated: the model needs to know where it
+/// got to and what not to say twice, and that costs a line each instead
+/// of the whole article again.
+fn continuation_prompt(base: &str, written: &[LessonPlanSection], wanted: Option<i64>) -> String {
+    let done: Vec<String> = written
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("{}. {}", i + 1, if s.title.is_empty() { "(tanpa judul)" } else { s.title.as_str() }))
+        .collect();
+    let next = written.len() + 1;
+    let target = match wanted {
+        Some(n) if n as usize > written.len() => format!("Tulis bagian {next} sampai {n}."),
+        _ => format!("Lanjutkan dari bagian {next}."),
+    };
+    format!(
+        "{base}\n\nLANJUTAN — JANGAN MENGULANG\nBagian berikut SUDAH ditulis dan tersimpan:\n{}\n\n{target} Mulai langsung dengan \"{SECTION_OPEN}\" untuk bagian berikutnya. Jangan menulis ulang bagian yang sudah ada, jangan menulis blok {PLAN_OPEN}, dan jangan mengulang penjelasan yang sudah diberikan di bagian-bagian itu.",
+        done.join("\n"),
+    )
+}
+
 fn plan_reply_is_complete(text: &str) -> bool {
     let opened = text.matches(SECTION_OPEN).count();
     opened > 0 && opened == text.matches(SECTION_CLOSE).count() && text.rfind(SECTION_CLOSE) > text.rfind(SECTION_OPEN)
@@ -259,6 +296,9 @@ pub fn parse_section_reply(text: &str, fallback: &LessonPlanSection) -> Option<L
         minutes: meta_minutes(&meta).or(fallback.minutes),
         goal: if goal.is_empty() { fallback.goal.clone() } else { goal },
         content: lesson_plan::sanitize_generated(content),
+        // Rewriting or translating a section's prose must not silently
+        // throw away its checkpoint pool.
+        checkpoint: fallback.checkpoint.clone(),
     })
 }
 
@@ -315,8 +355,86 @@ pub struct GeneratePlanResponse {
     pub lesson_plan: LessonPlan,
 }
 
+/// Readability calibration per jenjang — the article-side counterpart
+/// of `quiz_taxonomy::prompt_rules`, and it reuses that module's `Stage`
+/// on purpose: "Tahap 1" must never mean SD for the quiz and something
+/// else for the article it tests.
+///
+/// Exists because the pilot showed what a bare `Tingkat: {level}` line
+/// buys — Matematika Tahap 1 (SD/MI) came back with "himpunan bilangan
+/// untuk menyatakan kuantitas nyata yang utuh", "unsur identitas
+/// penjumlahan", "bilangan rasional tak utuh" and 2.170 words per bab.
+/// Correct, well-written, and unreadable for the 10-year-old who is
+/// supposed to study it alone. The model has no way to guess the
+/// register from a stage label it has never been told the meaning of,
+/// so the meaning is spelled out here.
+pub fn readability_rules(level: &str) -> String {
+    use crate::services::quiz_taxonomy::Stage;
+
+    // (sentence cap, words per section, register, what to ban)
+    let (jenjang, kalimat, kata, sapaan, larangan) = match Stage::infer(level) {
+        Some(Stage::Sd) => (
+            "SD/MI (sekitar 7-12 tahun)",
+            "Maksimal 15 kata per kalimat, satu gagasan per kalimat.",
+            "350-650 kata per bagian — bukan lebih. Bagian yang padat dipecah, bukan dipanjangkan.",
+            "Sapa siswa dengan \"kamu\". Nada hangat seperti guru yang duduk di sebelahnya.",
+            "Haram: istilah akademis di luar jenjang (mis. \"himpunan\", \"unsur identitas\", \"bilangan rasional\", \"notasi ilmiah\", \"kuantitas\", \"literasi numerasi\"), kalimat bertingkat dengan tanda pisah, dan istilah asing yang bukan materi target. Setiap kata baru yang memang wajib dipakai langsung dijelaskan memakai kata sehari-hari begitu pertama muncul.",
+        ),
+        Some(Stage::Smp) => (
+            "SMP/MTs (sekitar 13-15 tahun)",
+            "Maksimal 20 kata per kalimat.",
+            "450-900 kata per bagian.",
+            "Sapa siswa dengan \"kamu\".",
+            "Istilah teknis boleh dipakai, tetapi definisinya diberikan saat pertama muncul. Hindari notasi atau teori yang baru diajarkan di SMA.",
+        ),
+        Some(Stage::Sma) => (
+            "SMA/SMK/MA (sekitar 16-18 tahun)",
+            "Maksimal 25 kata per kalimat.",
+            "500-1200 kata per bagian.",
+            "Sapa siswa dengan \"kamu\" atau kalimat tanpa sapaan.",
+            "Istilah baku mapel boleh langsung dipakai. Turunan/pembuktian tingkat perguruan tinggi tetap dihindari kecuali topiknya memang itu.",
+        ),
+        Some(Stage::Kuliah) | Some(Stage::Pascasarjana) => (
+            "perguruan tinggi",
+            "Panjang kalimat bebas selama tetap jelas.",
+            "600-1500 kata per bagian.",
+            "Nada akademis, boleh tanpa sapaan.",
+            "Istilah teknis dipakai apa adanya. Sertakan rujukan/teori pendukung bila relevan.",
+        ),
+        Some(Stage::Umum) => (
+            "umum/dewasa (seleksi CPNS/BUMN, tes bahasa, pelatihan profesional)",
+            "Maksimal 25 kata per kalimat; lugas, langsung ke inti.",
+            "500-1200 kata per bagian.",
+            "Sapa pembaca dengan \"Anda\". Nada profesional dan praktis.",
+            "Hindari gaya kanak-kanak. Jelaskan istilah teknis saat pertama muncul, dan kaitkan dengan situasi kerja atau soal seleksi yang nyata.",
+        ),
+        // Unknown jenjang: the old default, so an author writing a
+        // one-off module without a level string is no worse off.
+        None => (
+            "tidak disebutkan — tulis untuk pembaca umum",
+            "Jaga kalimat tetap pendek dan jelas.",
+            "400-1200 kata per bagian.",
+            "Sapa siswa dengan \"kamu\".",
+            "Jelaskan istilah teknis saat pertama muncul.",
+        ),
+    };
+
+    format!(
+        "KALIBRASI JENJANG — WAJIB, INI YANG MENENTUKAN BOLEH-TIDAKNYA SEBUAH KALIMAT\n\
+Pembaca: {jenjang}. Ia membaca SENDIRI tanpa guru di sebelahnya.\n\
+- {kalimat}\n\
+- {kata}\n\
+- {sapaan}\n\
+- {larangan}\n\
+- Uji tiap paragraf: bila pembaca seusia itu harus membaca ulang untuk paham, tulis ulang lebih sederhana.\n\
+- Mulai dari hal yang sudah dikenal pembaca (benda, kejadian sehari-hari), baru masuk ke istilahnya."
+    )
+}
+
 pub fn generation_prompt(req: &GenerateLessonPlanRequest, subject: Option<&str>, language: &str) -> (String, String) {
     let subject_part = subject.map(|s| format!(" untuk mata pelajaran \"{s}\"")).unwrap_or_default();
+    let level = req.level.as_deref().map(str::trim).filter(|l| !l.is_empty()).unwrap_or("tentukan sendiri dari topik");
+    let readability = readability_rules(level);
     let system = format!(
         "{rules}\n\n\
 Anda adalah perancang kurikulum yang menyusun \"Modul Belajar\"{subject_part} di platform belajar Indonesia. \
@@ -324,8 +442,9 @@ Satu modul terdiri dari beberapa bagian (section) berurutan. Isi yang SAMA dipak
   • Mode baca mandiri — siswa membaca bagian demi bagian seperti artikel yang mendalam.\n\
   • Rujukan AI tutor — AI mengajarkan bagian demi bagian.\n\
 Karena itu setiap bagian harus menjadi bahan ajar yang utuh: kaya penjelasan, contoh, dan ilustrasi.\n\n\
-KEDALAMAN TIAP BAGIAN — DEFAULT: LENGKAP\n\
-- 400-1500 kata per bagian; boleh lebih bila topiknya menuntut. Jangan dipersingkat secara artifisial.\n\
+{readability}\n\n\
+KEDALAMAN TIAP BAGIAN\n\
+- Panjang mengikuti KALIBRASI JENJANG di atas — itu batas keras, bukan saran. Jangan memanjangkan demi terlihat lengkap.\n\
 - 3-6 paragraf penjelasan yang jelas.\n\
 - Banyak contoh konkret: 5-12 contoh kalimat, soal yang diselesaikan, atau potongan kode — sesuai mapelnya.\n\
 - Minimal satu dari: tabel, daftar, perbandingan, langkah-langkah.\n\
@@ -347,6 +466,7 @@ isi bagian dalam format ALM, ditulis apa adanya — BUKAN JSON, tanpa escape\n\
 (ulangi blok {SECTION_OPEN} untuk setiap bagian)\n\n\
 Hanya judul, menit, dan tujuan yang berupa JSON. Isi bagian ditulis mentah di antara {CONTENT_OPEN} dan {SECTION_CLOSE}.",
         rules = language_rules(&req.language, language),
+        readability = readability,
     );
 
     let mut user = String::new();
@@ -359,7 +479,6 @@ INSTRUKSI KHUSUS DARI PENULIS — WAJIB DIPATUHI\n\
 Bila bertentangan dengan parameter atau aturan di bawah, IKUTI BLOK INI.\n\n"
         ));
     }
-    let level = req.level.as_deref().map(str::trim).filter(|l| !l.is_empty()).unwrap_or("tentukan sendiri dari topik");
     let count_line = match req.section_count {
         Some(n) => format!("Jumlah bagian: tepat {n} — berurutan 1..{n}, tidak boleh kurang atau lebih."),
         None => "Jumlah bagian: tentukan sendiri (biasanya 5-10). Bila penulis menyebut jumlah tertentu di instruksi khusus atau topik (mis. \"7 bagian\"), ikuti angka itu persis.".to_string(),
@@ -401,38 +520,67 @@ pub async fn generate_plan(pool: &PgPool, ai: &dyn AIProvider, model: &str, ctx:
     // own explanation blocks. Ask for the model's whole budget;
     // resolve_max_tokens still clamps it to what the model allows.
     let max_tokens = resolve_max_tokens(pool, model, 65_536).await;
-    let request = GenerationRequest { model: model.to_string(), system_prompt, user_prompt, temperature: 0.5, max_tokens, image_url: None, json_mode: false };
+    let request = GenerationRequest { model: model.to_string(), system_prompt, user_prompt, temperature: 0.5, max_tokens, image_url: None, json_mode: false, thinking_budget: None, allow_partial: true };
 
-    // One retry — a transient provider failure or a reply with no
-    // parseable sections both tend to be one-off flakiness, not a
-    // reason to make the author wait a full minute for nothing and
-    // click "Buat Modul" again themselves.
-    let mut outcome = None;
+    // A cut-off reply is CONTINUED, never re-asked. An article long
+    // enough to exceed the model's output ceiling is a normal article,
+    // not a failure, so each pass keeps the sections that closed and
+    // asks only for the ones after them. A transient provider error or
+    // a reply with no sections at all still gets one plain retry, since
+    // those are flakiness rather than length.
+    const MAX_PASSES: usize = 5;
+    let mut plan: Option<LessonPlan> = None;
+    let mut tokens_used: i64 = 0;
     let mut last_error = String::new();
-    for attempt in 0..2 {
-        let generation = match ai.generate(request.clone()).await {
+    let mut retried = false;
+
+    for pass in 0..MAX_PASSES {
+        let mut request = request.clone();
+        if let Some(built) = plan.as_ref().filter(|p| !p.sections.is_empty()) {
+            request.user_prompt = continuation_prompt(&request.user_prompt, &built.sections, req.section_count);
+        }
+        let generation = match ai.generate(request).await {
             Ok(g) => g,
             Err(e) => {
-                tracing::warn!(error = ?e, %ai_task_id, attempt, "lesson plan generation provider call failed");
+                tracing::warn!(error = ?e, %ai_task_id, pass, "lesson plan generation provider call failed");
                 last_error = format!("Provider gagal: {e}");
+                if retried {
+                    break;
+                }
+                retried = true;
                 continue;
             }
         };
-        if !plan_reply_is_complete(&generation.text) {
-            tracing::warn!(%ai_task_id, attempt, raw_len = generation.text.len(), "lesson plan generation reply was cut off before its last section closed");
-            last_error = "Balasan model terpotong sebelum modul selesai.".to_string();
+        tokens_used += generation.tokens_used.unwrap_or(0);
+        let complete = !generation.truncated && plan_reply_is_complete(&generation.text);
+        // Whatever closed is finished work, even in a truncated reply.
+        let usable = if complete { generation.text.as_str() } else { complete_prefix(&generation.text) };
+        let parsed = parse_generated_plan(usable);
+        let added = parsed.sections.len();
+        match plan.as_mut() {
+            Some(built) => built.sections.extend(parsed.sections),
+            None if added > 0 => plan = Some(parsed),
+            None => {}
+        }
+        let have = plan.as_ref().map_or(0, |p| p.sections.len());
+
+        if added > 0 && complete && req.section_count.is_none_or(|n| have as i64 >= n) {
+            break;
+        }
+        if added == 0 {
+            // Nothing closed this pass: continuing would repeat it.
+            tracing::warn!(%ai_task_id, pass, complete, raw_len = generation.text.len(), "lesson plan pass produced no complete section");
+            last_error = if complete { "Model tidak mengembalikan bagian modul apa pun.".to_string() } else { "Balasan model terpotong sebelum satu bagian pun selesai.".to_string() };
+            if have > 0 || retried {
+                break;
+            }
+            retried = true;
             continue;
         }
-        let plan = parse_generated_plan(&generation.text);
-        if plan.sections.is_empty() {
-            tracing::warn!(%ai_task_id, attempt, raw_output = %generation.text, "lesson plan generation returned no sections");
-            last_error = "Model tidak mengembalikan bagian modul apa pun.".to_string();
-            continue;
-        }
-        outcome = Some((plan, generation));
-        break;
+        tracing::info!(%ai_task_id, pass, added, have, complete, "lesson plan continued past the output ceiling");
     }
-    let Some((mut plan, generation)) = outcome else {
+
+    let Some(mut plan) = plan.filter(|p| !p.sections.is_empty()) else {
         tracing::warn!(%ai_task_id, "lesson plan generation failed after retry");
         record_failed(pool, ai_task_id, ctx.user_id, "lesson_plan_generation", model, GENERATE_PROMPT_ID).await;
         return Err(AppError::AiOutputValidationFailed(Some(last_error)));
@@ -450,7 +598,7 @@ pub async fn generate_plan(pool: &PgPool, ai: &dyn AIProvider, model: &str, ctx:
     }
     let plan = lesson_plan::normalize(plan)?;
 
-    ai_task::insert_done(pool, ai_task_id, ctx.user_id, "lesson_plan_generation", PROVIDER, model, GENERATE_PROMPT_ID, generation.tokens_used.map(|t| t as i32)).await?;
+    ai_task::insert_done(pool, ai_task_id, ctx.user_id, "lesson_plan_generation", PROVIDER, model, GENERATE_PROMPT_ID, Some(tokens_used as i32)).await?;
     Ok(GeneratePlanResponse { ai_task_id, lesson_plan: plan })
 }
 
@@ -504,7 +652,7 @@ struct ReferencedItem {
 /// items in this module" resolution instead of a second copy — a quiz
 /// group's `reference_module_item_ids` is the same idea as a lesson
 /// section's, just phrased for a different consumer.
-pub(crate) async fn referenced_items_block(pool: &PgPool, item_id: Uuid, ids: &[Uuid]) -> Result<String, AppError> {
+pub(crate) async fn referenced_items_block(pool: &PgPool, item_id: Uuid, ids: &[Uuid], section_id: Option<&str>) -> Result<String, AppError> {
     if ids.is_empty() {
         return Ok(String::new());
     }
@@ -550,6 +698,15 @@ pub(crate) async fn referenced_items_block(pool: &PgPool, item_id: Uuid, ids: &[
         }
         let plan = row.lesson_plan.as_ref().and_then(|v| lesson_plan::parse(v).ok());
         let body = match plan {
+            // One section asked for: hand over THAT section whole (a few
+            // hundred words) instead of the first 3000 characters of the
+            // whole article. Smaller prompt, and questions that test the
+            // section they were asked about.
+            Some(plan) if section_id.is_some_and(|id| plan.sections.iter().any(|s| s.id == id)) => {
+                let section = plan.sections.iter().find(|s| Some(s.id.as_str()) == section_id).expect("just matched");
+                out.push_str(&format!("  Bagian yang diuji: {}{}\n", section.title, if section.goal.is_empty() { String::new() } else { format!(" — {}", section.goal) }));
+                section.content.clone()
+            }
             Some(plan) => {
                 for (i, s) in plan.sections.iter().enumerate() {
                     out.push_str(&format!("  {}. {}{}\n", i + 1, s.title, if s.goal.is_empty() { String::new() } else { format!(" — {}", s.goal) }));
@@ -622,12 +779,12 @@ Daftar bagian dalam modul ini:\n",
             user.push_str(&format!("--- @{} ({}) ---\nTujuan: {}\nCuplikan isi:\n{}\n\n", i + 1, s.title, s.goal, excerpt(&s.content, 2500)));
         }
     }
-    user.push_str(&referenced_items_block(pool, req.item_id, &req.referenced_item_ids).await?);
+    user.push_str(&referenced_items_block(pool, req.item_id, &req.referenced_item_ids, None).await?);
     user.push_str(&format!("Kembalikan HANYA dua blok ({META_OPEN}…{META_CLOSE} dan {CONTENT_OPEN}…{CONTENT_CLOSE})."));
 
     let ai_task_id = Uuid::new_v4();
     let max_tokens = resolve_max_tokens(pool, model, 16_000).await;
-    let request = GenerationRequest { model: model.to_string(), system_prompt: edit_system_prompt(), user_prompt: user, temperature: 0.4, max_tokens, image_url: None, json_mode: false };
+    let request = GenerationRequest { model: model.to_string(), system_prompt: edit_system_prompt(), user_prompt: user, temperature: 0.4, max_tokens, image_url: None, json_mode: false, thinking_budget: None, allow_partial: false };
 
     // One retry, same reasoning as generate_plan above: a stray provider
     // hiccup or an unparseable/invalid reply is usually a one-off, and
@@ -705,6 +862,7 @@ async fn translate_section(ai: &dyn AIProvider, model: &str, language: &str, max
             max_tokens,
             image_url: None,
             json_mode: false,
+        thinking_budget: None, allow_partial: false,
         })
         .await
         .map_err(|e| tracing::warn!(error = ?e, "section translation provider call failed"))?;
@@ -727,6 +885,7 @@ async fn translate_header(ai: &dyn AIProvider, model: &str, language: &str, plan
             max_tokens: 800,
             image_url: None,
             json_mode: true,
+            thinking_budget: None, allow_partial: false,
         })
         .await
         .ok()?;
@@ -807,6 +966,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn readability_rules_track_the_jenjang_the_level_string_names() {
+        // The library's own staging, a school name, and a bare stage all
+        // have to land on the same calibration — same inference the quiz
+        // taxonomy uses, so a module and its quiz never disagree.
+        for level in ["Tahap 1 — Matematika Dasar", "SD kelas 5", "MI"] {
+            let rules = readability_rules(level);
+            assert!(rules.contains("SD/MI"), "{level} should read as SD: {rules}");
+            assert!(rules.contains("15 kata"), "SD needs the short-sentence cap: {rules}");
+            assert!(rules.contains("350-650 kata"), "SD sections must be short: {rules}");
+            // The exact words the pilot produced for an SD module.
+            assert!(rules.contains("himpunan") && rules.contains("bilangan rasional"), "the banned-term list is what stops the pilot's register: {rules}");
+        }
+
+        let sma = readability_rules("Tahap 3");
+        assert!(sma.contains("SMA/SMK/MA") && sma.contains("500-1200 kata"));
+
+        let kuliah = readability_rules("S1 Teknik Informatika");
+        assert!(kuliah.contains("perguruan tinggi") && kuliah.contains("600-1500 kata"));
+    }
+
+    #[test]
+    fn an_unknown_level_still_gets_usable_rules_instead_of_nothing() {
+        let rules = readability_rules("tentukan sendiri dari topik");
+        assert!(rules.contains("KALIBRASI JENJANG"));
+        assert!(rules.contains("pembaca umum"), "no jenjang named must not mean no guidance: {rules}");
+    }
+
+    #[test]
+    fn the_generation_prompt_carries_the_jenjang_calibration() {
+        let req = GenerateLessonPlanRequest {
+            item_id: Uuid::new_v4(),
+            topic: "Mengenal Bilangan Cacah".into(),
+            duration_minutes: 45,
+            level: Some("Tahap 1 — Matematika Dasar".into()),
+            language: "id".into(),
+            notes: None,
+            section_count: Some(5),
+            model: None,
+        };
+        let (system, _user) = generation_prompt(&req, Some("Matematika"), "Bahasa Indonesia");
+        assert!(system.contains("KALIBRASI JENJANG"));
+        assert!(system.contains("SD/MI"));
+        // The old flat "400-1500 kata per bagian" default is exactly what
+        // gave a 10-year-old 2.170 words per bab; it must be gone, with
+        // the length now coming from the calibration block instead.
+        assert!(!system.contains("400-1500 kata"), "the jenjang-blind length default must not survive: {system}");
+    }
+
+    #[test]
     fn parses_a_delimited_plan() {
         let text = "Berikut modulnya:\n<<<PLAN>>>\n{\"title\": \"Gerak Lurus\", \"topic\": \"GLB\", \"level\": \"SMA\"}\n<<<END_PLAN>>>\n\
 <<<SECTION>>>\n{\"title\": \"Pengantar\", \"minutes\": 8, \"goal\": \"Paham GLB\"}\n<<<CONTENT>>>\nKecepatan $v = \\frac{s}{t}$ tetap.\n<<<END_SECTION>>>\n\
@@ -825,7 +1033,7 @@ mod tests {
 
     #[test]
     fn section_reply_keeps_id_and_falls_back_on_missing_meta() {
-        let original = LessonPlanSection { id: "abc".into(), title: "Lama".into(), minutes: Some(5), goal: "Tujuan".into(), content: "Isi lama.".into() };
+        let original = LessonPlanSection { id: "abc".into(), title: "Lama".into(), minutes: Some(5), goal: "Tujuan".into(), content: "Isi lama.".into(), checkpoint: None };
         let reply = "<<<META>>>\n{\"title\": \"Baru\"}\n<<<END_META>>>\n<<<CONTENT>>>\nIsi **baru**.\n<<<END_CONTENT>>>";
         let out = parse_section_reply(reply, &original).unwrap();
         assert_eq!(out.id, "abc");

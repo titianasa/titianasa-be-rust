@@ -175,7 +175,7 @@ impl VertexGeminiProvider {
     /// One request, with its failure classified. Everything that can be
     /// told apart only here — the HTTP status, whether the connection
     /// dropped — is decided here, before it collapses into a string.
-    async fn generate_once(&self, model: &str, body: &serde_json::Value) -> Result<GenerationResponse, Failure> {
+    async fn generate_once(&self, model: &str, body: &serde_json::Value, req_allows_partial: bool) -> Result<GenerationResponse, Failure> {
         let token = self
             .tokens
             .token(&[CLOUD_PLATFORM_SCOPE])
@@ -208,8 +208,14 @@ impl VertexGeminiProvider {
         // A reply the model itself cut short is not a busy server — the
         // same request would stop the same way, so it is left to the
         // caller's own (output-validating) retry instead.
-        ensure_finished(finish_reason.as_deref()).map_err(|error| Failure { error, transient: false })?;
         let text = candidate.and_then(|c| candidate_text(c.content));
+        // Stopped at the output ceiling with real text to show, for a
+        // caller that continues partial replies itself: hand the text
+        // over marked truncated instead of discarding tokens already paid.
+        let truncated = finish_reason.as_deref() == Some("MAX_TOKENS") && req_allows_partial && text.as_deref().is_some_and(|t| !t.trim().is_empty());
+        if !truncated {
+            ensure_finished(finish_reason.as_deref()).map_err(|error| Failure { error, transient: false })?;
+        }
 
         // Gemini reports a truncated response via `finishReason` (e.g.
         // "MAX_TOKENS") rather than an empty `content`, the way
@@ -220,7 +226,7 @@ impl VertexGeminiProvider {
             Failure::permanent(format!("empty or missing candidate text in Vertex AI response (finishReason: {})", finish_reason.as_deref().unwrap_or("unknown")))
         })?;
 
-        Ok(GenerationResponse { text, tokens_used: parsed.usage_metadata.and_then(|u| u.total_token_count) })
+        Ok(GenerationResponse { text, tokens_used: parsed.usage_metadata.and_then(|u| u.total_token_count), truncated })
     }
 
     async fn build_body(&self, req: &GenerationRequest) -> Result<serde_json::Value, AIProviderError> {
@@ -230,6 +236,11 @@ impl VertexGeminiProvider {
         });
         if req.json_mode {
             generation_config["responseMimeType"] = serde_json::json!("application/json");
+        }
+        // Without this the model decides its own thinking budget out of
+        // the SAME maxOutputTokens the answer has to fit in.
+        if let Some(budget) = req.thinking_budget {
+            generation_config["thinkingConfig"] = serde_json::json!({"thinkingBudget": budget});
         }
 
         let mut parts = vec![serde_json::json!({"text": req.user_prompt})];
@@ -309,7 +320,7 @@ impl AIProvider for VertexGeminiProvider {
         let body = self.build_body(&req).await?;
         let mut attempt = 0;
         loop {
-            match self.generate_once(&req.model, &body).await {
+            match self.generate_once(&req.model, &body, req.allow_partial).await {
                 Ok(response) => return Ok(response),
                 Err(Failure { error, transient: true }) if attempt < TRANSIENT_RETRY_DELAYS.len() => {
                     let delay = backoff_delay(attempt, rand::random::<f64>());

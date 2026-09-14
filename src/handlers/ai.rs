@@ -155,6 +155,8 @@ pub async fn post_generate_quiz_group(
         raw_text: body.raw_text,
         convert_to_subtype: None,
         mark_draft: body.mark_draft,
+        slots: body.slots,
+        reference_section_id: body.reference_section_id,
     };
     let result = generate_quiz_group(
         &state.db,

@@ -168,6 +168,7 @@ pub async fn generate_turn(pool: &PgPool, ai: &dyn AIProvider, model: &str, req:
             // `content`, confirmed live on a previously-failing Arabic
             // turn.
             json_mode: true,
+            thinking_budget: None, allow_partial: false,
         })
         .await
         .map_err(|e| {
@@ -227,7 +228,7 @@ Evaluate the student's speaking performance:\n\
 
     let max_tokens = resolve_max_tokens(pool, model, 3000).await;
     let generation = ai
-        .generate(GenerationRequest { model: model.to_string(), system_prompt, user_prompt, temperature: 0.5, max_tokens, image_url: None, json_mode: true })
+        .generate(GenerationRequest { model: model.to_string(), system_prompt, user_prompt, temperature: 0.5, max_tokens, image_url: None, json_mode: true, thinking_budget: None, allow_partial: false })
         .await
         .map_err(|e| {
             tracing::warn!(error = ?e, "speaking room session summary generation failed");

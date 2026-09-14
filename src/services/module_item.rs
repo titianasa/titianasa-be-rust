@@ -271,6 +271,20 @@ pub async fn create_with_provenance(pool: &PgPool, ctx: &AuthContext, module_id:
     Ok(to_status_response(&row))
 }
 
+/// Who may read answer keys and checkpoint pools: authors/reviewers, the
+/// teacher of a class using this module (they mark and explain), and a
+/// collaborator explicitly shared onto the item. Everyone else — every
+/// learner — gets `quiz_config::learner_view`/`lesson_plan::learner_view`.
+pub async fn sees_answer_key(pool: &PgPool, ctx: &AuthContext, item_id: Uuid) -> Result<bool, AppError> {
+    if is_allowed(ctx.role.as_deref(), Resource::ModuleItem, Action::ViewUnpublished) {
+        return Ok(true);
+    }
+    if crate::services::item_progress::can_review_item(pool, ctx, item_id).await? {
+        return Ok(true);
+    }
+    crate::services::resource_share::has_module_item_grant(pool, ctx.user_id, ctx.role.as_deref(), item_id, "viewer").await
+}
+
 // GET /module-items/{id} — unpublished items 403 for everyone except
 // curriculum_developer/reviewer/admin roles.
 pub async fn get_detail(pool: &PgPool, ctx: &AuthContext, item_id: Uuid) -> Result<ModuleItemDetailResponse, AppError> {
@@ -297,8 +311,11 @@ pub async fn get_detail(pool: &PgPool, ctx: &AuthContext, item_id: Uuid) -> Resu
     // Read separately rather than widening ItemRow, which a dozen
     // queries here select into and none of the others need these.
     let extra = sqlx::query!(r#"select lesson_plan, guard_config, attendance_guard from module_items where id = $1"#, item_id).fetch_one(pool).await?;
+    let full_view = sees_answer_key(pool, ctx, item_id).await?;
+    let can_preview = crate::services::assessment::can_preview(pool, ctx, item_id).await?;
     Ok(ModuleItemDetailResponse {
-        lesson_plan: extra.lesson_plan,
+        can_preview,
+        lesson_plan: if full_view { extra.lesson_plan } else { extra.lesson_plan.as_ref().map(crate::services::lesson_plan::learner_view) },
         guard_config: extra.guard_config,
         attendance_guard: extra.attendance_guard,
         id: item.id,
@@ -307,7 +324,7 @@ pub async fn get_detail(pool: &PgPool, ctx: &AuthContext, item_id: Uuid) -> Resu
         node_type: item.node_type,
         title: item.title,
         content_type: item.content_type,
-        quiz_config: item.quiz_config,
+        quiz_config: if full_view { item.quiz_config } else { item.quiz_config.as_ref().map(crate::services::quiz_config::learner_view) },
         status: item.status,
         qa_report: item.qa_report,
         generated_by: item.generated_by,
@@ -473,6 +490,10 @@ pub async fn update_quiz_config(pool: &PgPool, ctx: &AuthContext, item_id: Uuid,
     // write path calls the same function — see quiz_generation.rs).
     let mut parsed = crate::services::quiz_config_schema::parse(&quiz_config)?;
     crate::services::quiz_config::ensure_question_uids(&mut parsed);
+    crate::services::quiz_config::detect_order_constraints(&mut parsed);
+    if let Some(pool_cfg) = &parsed.question_pool {
+        validate_question_pool(pool, item.module_id, item_id, pool_cfg).await?;
+    }
     let quiz_config = serde_json::to_value(&parsed).map_err(|e| AppError::Internal(e.into()))?;
     crate::services::quiz_config_schema::validate_structure(&quiz_config)?;
 
@@ -486,6 +507,31 @@ pub async fn update_quiz_config(pool: &PgPool, ctx: &AuthContext, item_id: Uuid,
     .fetch_one(pool)
     .await?;
     Ok(to_status_response(&row))
+}
+
+/// A "Latihan 10/25 soal" draw must point at a quiz in the SAME module (a
+/// learner who can open this item can open that one) with enough flat
+/// questions to draw from — checked on save so a bad pool surfaces in the
+/// builder, not as a learner's broken "Mulai".
+async fn validate_question_pool(pool: &PgPool, module_id: Uuid, item_id: Uuid, cfg: &crate::services::quiz_config::QuestionPool) -> Result<(), AppError> {
+    let bad = |detail: &str| AppError::UnprocessableEntity("invalid_question_pool", detail.to_string());
+    if cfg.draw_count < 1 {
+        return Err(bad("question_pool.draw_count minimal 1"));
+    }
+    let Some(source_id) = cfg.source_item_id.filter(|id| *id != item_id) else { return Ok(()) };
+    let source = sqlx::query!(r#"select module_id, content_type, quiz_config from module_items where id = $1"#, source_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| bad("bank soal (question_pool.source_item_id) tidak ditemukan"))?;
+    if source.module_id != module_id || source.content_type.as_deref() != Some("quiz") {
+        return Err(bad("bank soal harus berupa kuis di modul yang sama"));
+    }
+    if let Some(bank) = source.quiz_config.as_ref().and_then(|raw| crate::services::quiz_config_schema::parse(raw).ok()) {
+        if bank.question_pool.is_some_and(|p| p.source_item_id.is_some_and(|id| id != source_id)) {
+            return Err(bad("bank soal tidak boleh mengundi dari bank lain"));
+        }
+    }
+    Ok(())
 }
 
 // PATCH /module-items/{id}/lesson-plan — the Modul Belajar editor's
@@ -656,7 +702,7 @@ pub async fn delete(pool: &PgPool, ctx: &AuthContext, item_id: Uuid) -> Result<(
     for id in &ids {
         let has_history = sqlx::query_scalar!(
             r#"select exists(
-                 select 1 from attempts where item_id = $1
+                 select 1 from attempts where item_id = $1 and not is_preview
                  union all select 1 from canvas_sessions where item_id = $1
                  union all select 1 from item_completion_overrides where item_id = $1
                ) as "has_history!""#,
@@ -673,6 +719,9 @@ pub async fn delete(pool: &PgPool, ctx: &AuthContext, item_id: Uuid) -> Result<(
     }
 
     let mut tx = pool.begin().await?;
+    // Previews are not learner history (migrations/0056) — they go with
+    // the item instead of blocking its delete.
+    crate::services::assessment::purge_preview_attempts(&mut tx, &ids).await?;
     for id in &ids {
         sqlx::query!(r#"delete from content_blocks where item_id = $1"#, id).execute(&mut *tx).await?;
         sqlx::query!(r#"delete from resource_shares where resource_type = 'module_item' and resource_id = $1"#, id).execute(&mut *tx).await?;

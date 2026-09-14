@@ -10,12 +10,28 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::errors::AppError;
+use crate::services::ai_provider::AIProvider;
+use crate::Config;
+
+/// What a job handler gets to work with. The rollup only needs the pool;
+/// the Pabrik Konten generator needs Gemini and the role settings too —
+/// so the worker builds the same providers the API does, once.
+#[derive(Clone)]
+pub struct JobContext {
+    pub pool: PgPool,
+    pub config: Arc<Config>,
+    /// Vertex Gemini — text generation and QA.
+    pub text_ai: Arc<dyn AIProvider>,
+    /// OpenRouter — vision/STT/TTS (unused by current handlers).
+    pub ai: Arc<dyn AIProvider>,
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Job {
@@ -192,15 +208,15 @@ pub async fn reap(pool: &PgPool, stuck_after: Duration) -> Result<i64, AppError>
 }
 
 /// One entry per `job_type` `titian-worker` knows how to run. Takes an
-/// owned `PgPool` (cheap — internally an `Arc`) and owned `payload`
-/// rather than borrowing, so `run`'s returned future can be `'static`
-/// and boxed without lifetime gymnastics at every call site.
+/// owned `JobContext` (cheap — pool and providers are `Arc`s) and owned
+/// `payload` rather than borrowing, so `run`'s returned future can be
+/// `'static` and boxed without lifetime gymnastics at every call site.
 pub struct JobTypeHandler {
     pub job_type: &'static str,
-    pub run: fn(PgPool, serde_json::Value) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>,
+    pub run: fn(JobContext, serde_json::Value) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>,
 }
 
-pub const HANDLERS: &[JobTypeHandler] = &[crate::services::metrics_rollup::HANDLER];
+pub const HANDLERS: &[JobTypeHandler] = &[crate::services::metrics_rollup::HANDLER, crate::services::content_factory::HANDLER];
 
 pub fn known_job_types() -> Vec<&'static str> {
     HANDLERS.iter().map(|h| h.job_type).collect()

@@ -93,10 +93,14 @@ pub const AI_ROLES: &[AiRoleInfo] = &[
     AiRoleInfo { id: "speaking_room_tts", label: "Ruang Bicara — Suara", required_capabilities: &["tts"], env_fallback: |c| &c.ai_speaking_room_tts_model },
     AiRoleInfo { id: "stt", label: "Ubah Suara ke Teks (STT)", required_capabilities: &["stt"], env_fallback: |c| &c.ai_stt_model },
     AiRoleInfo { id: "tts", label: "Ubah Teks ke Suara (TTS)", required_capabilities: &["tts"], env_fallback: |c| &c.ai_tts_model },
+    // Pabrik Konten (ADR-0015): designing the bab structure of topics.
+    // `agent_qa` below is the judge that scores what this produces —
+    // deliberately a separate role so it can run on a stronger model.
+    AiRoleInfo { id: "curriculum_planning", label: "Pabrik Konten — Menyusun Bab", required_capabilities: &["text", "json"], env_fallback: |c| &c.ai_lesson_generation_model },
     // ADR-0013 agent roles — registered now, first caller is Fase 42.
     AiRoleInfo { id: "agent_diagnosis", label: "Agen AI — Diagnosis Konten", required_capabilities: &["text"], env_fallback: agent_default },
     AiRoleInfo { id: "agent_editor", label: "Agen AI — Editor Konten", required_capabilities: &["text"], env_fallback: agent_default },
-    AiRoleInfo { id: "agent_qa", label: "Agen AI — QA Konten", required_capabilities: &["text"], env_fallback: agent_default },
+    AiRoleInfo { id: "agent_qa", label: "Agen AI — QA Konten (penilai Pabrik Konten)", required_capabilities: &["text"], env_fallback: agent_default },
     AiRoleInfo { id: "agent_reporter", label: "Agen AI — Pelapor", required_capabilities: &["text"], env_fallback: agent_default },
 ];
 
@@ -400,6 +404,7 @@ pub async fn test_role(pool: &PgPool, config: &Config, ctx: &AuthContext, ai: &d
             max_tokens,
             image_url: None,
             json_mode: false,
+        thinking_budget: None, allow_partial: false,
         })
         .await
         .map_err(|e| validation_error("ai_test_failed", format!("uji model gagal: {e}")))?;
@@ -451,6 +456,80 @@ pub async fn patch_catalog_entry(pool: &PgPool, ctx: &AuthContext, id: Uuid, inp
     )
     .await?;
 
+    Ok(after)
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct CreateCatalogInput {
+    pub provider: String,
+    pub model_id: String,
+    pub label: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub max_output_tokens: Option<i32>,
+    #[serde(default)]
+    pub price_input_per_mtok_idr: Option<i32>,
+    #[serde(default)]
+    pub price_output_per_mtok_idr: Option<i32>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+const KNOWN_PROVIDERS: [&str; 2] = ["vertex", "openrouter"];
+const KNOWN_CAPABILITIES: [&str; 5] = ["text", "json", "vision", "stt", "tts"];
+
+/// POST /admin/ai/catalog — registering a model the platform can route a
+/// role to (e.g. a stronger Vertex model for the Pabrik Konten judge).
+/// Whether the model actually answers is what "Uji model" on the role
+/// is for; this only records it.
+pub async fn create_catalog_entry(pool: &PgPool, ctx: &AuthContext, input: CreateCatalogInput) -> Result<CatalogEntry, AppError> {
+    require_permission(ctx, Resource::AdminPusat, Action::Manage)?;
+    let model_id = input.model_id.trim();
+    let label = input.label.trim();
+    if !KNOWN_PROVIDERS.contains(&input.provider.as_str()) {
+        return Err(validation_error("invalid_provider", "provider harus vertex atau openrouter".to_string()));
+    }
+    if model_id.is_empty() || model_id.len() > 120 || model_id.chars().any(char::is_whitespace) {
+        return Err(validation_error("invalid_model_id", "model_id wajib diisi, tanpa spasi".to_string()));
+    }
+    if label.is_empty() {
+        return Err(validation_error("invalid_label", "label wajib diisi".to_string()));
+    }
+    if input.capabilities.is_empty() || input.capabilities.iter().any(|c| !KNOWN_CAPABILITIES.contains(&c.as_str())) {
+        return Err(validation_error("invalid_capabilities", "kemampuan harus dari: text, json, vision, stt, tts".to_string()));
+    }
+    let inserted = sqlx::query_scalar!(
+        r#"insert into ai_model_catalog (provider, model_id, label, capabilities, max_output_tokens, price_input_per_mtok_idr, price_output_per_mtok_idr)
+           values ($1, $2, $3, $4, $5, $6, $7)
+           on conflict (provider, model_id) do nothing
+           returning id"#,
+        input.provider,
+        model_id,
+        label,
+        &input.capabilities,
+        input.max_output_tokens,
+        input.price_input_per_mtok_idr,
+        input.price_output_per_mtok_idr,
+    )
+    .fetch_optional(pool)
+    .await?;
+    let Some(id) = inserted else {
+        return Err(AppError::Conflict("ai_model_already_exists"));
+    };
+    invalidate_cache(pool).await;
+    let after = catalog_list(pool).await?.into_iter().find(|c| c.id == id).expect("just wrote this row");
+    crate::services::admin_audit::record(
+        pool,
+        Some(ctx.user_id),
+        "ai_model_catalog.created",
+        "ai_model_catalog",
+        Some(id),
+        None,
+        Some(serde_json::to_value(&after).expect("CatalogEntry serializes")),
+        input.reason.as_deref(),
+    )
+    .await?;
     Ok(after)
 }
 

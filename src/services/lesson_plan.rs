@@ -53,7 +53,17 @@ pub struct LessonPlanSection {
     /// ALM source.
     #[serde(default)]
     pub content: String,
+    /// The comprehension check at the end of this section: a small pool
+    /// of questions in the quiz shape (`{"question_groups": [...]}`, flat
+    /// auto-graded subtypes only) that `section_checkpoint` draws from.
+    /// Never sent to a learner (`learner_view`) and never projected into
+    /// content_blocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<serde_json::Value>,
 }
+
+/// Default number of questions a checkpoint draws from its pool.
+pub const CHECKPOINT_DRAW: i64 = 2;
 
 fn invalid(detail: String) -> AppError {
     AppError::UnprocessableEntity("invalid_lesson_plan", detail)
@@ -108,8 +118,46 @@ pub fn normalize(mut plan: LessonPlan) -> Result<LessonPlan, AppError> {
         section.minutes = section.minutes.map(|m| m.clamp(1, 600));
         section.content = section.content.trim().to_string();
         validate_content(&section.content).map_err(|e| in_section(index, e))?;
+        if let Some(raw) = section.checkpoint.take() {
+            section.checkpoint = normalize_checkpoint(&raw).map_err(|e| in_section(index, e))?;
+        }
     }
     Ok(plan)
+}
+
+/// Parses a checkpoint pool, gives its questions permanent uids and order
+/// flags, and rejects what a checkpoint can't grade instantly: anything
+/// but a flat, auto-scored subtype. An empty pool normalizes to None.
+fn normalize_checkpoint(raw: &serde_json::Value) -> Result<Option<serde_json::Value>, AppError> {
+    use crate::services::{quiz_config, quiz_config_schema, quiz_subtype};
+    let mut pool = quiz_config_schema::parse(raw).map_err(|_| invalid("checkpoint harus berbentuk {\"question_groups\": [...]}".to_string()))?;
+    pool.question_groups.retain(|g| !g.questions.is_empty());
+    if pool.question_groups.is_empty() {
+        return Ok(None);
+    }
+    for group in &pool.question_groups {
+        let ok = quiz_subtype::find(&group.r#type)
+            .is_some_and(|info| matches!(info.grading_mode, quiz_subtype::GradingMode::Auto) && matches!(info.layout, quiz_subtype::LayoutKind::Flat));
+        if !ok {
+            return Err(invalid(format!("checkpoint tidak bisa memakai jenis soal \"{}\" — hanya jenis yang dinilai otomatis satu per soal", group.r#type)));
+        }
+    }
+    quiz_config::ensure_question_uids(&mut pool);
+    quiz_config::detect_order_constraints(&mut pool);
+    Ok(Some(serde_json::to_value(&pool).map_err(|e| AppError::Internal(e.into()))?))
+}
+
+/// The plan as a learner may receive it: each section's checkpoint pool
+/// carries answer keys, and a learner is handed checkpoint questions one
+/// server-side draw at a time (`section_checkpoint`), never the pool.
+pub fn learner_view(raw: &serde_json::Value) -> serde_json::Value {
+    let mut out = raw.clone();
+    if let Some(sections) = out.get_mut("sections").and_then(serde_json::Value::as_array_mut) {
+        for section in sections.iter_mut().filter_map(serde_json::Value::as_object_mut) {
+            section.remove("checkpoint");
+        }
+    }
+    out
 }
 
 /// The plan as one ALM document, for content_blocks.
@@ -138,29 +186,120 @@ fn flatten_json(value: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
-/// A directive block the schema rejected, turned back into prose: its
-/// `key: value` lines become paragraphs holding just the values. Losing
-/// the formatting is far better than losing the words — or failing a
-/// whole generated module over one mistyped callout variant.
-fn demote_directive(raw: &str) -> String {
+/// Key names a model reaches for that the schema does not have. A
+/// rename keeps the block: the content is right, only the label is
+/// wrong, and demoting it would throw away a whole table to punish one
+/// word.
+const KEY_ALIASES: &[(&str, &str, &str)] = &[
+    ("table", "title", "caption"),
+    ("steps", "steps", "items"),
+    ("steps", "langkah", "items"),
+    ("callout", "body", "text"),
+    ("callout", "content", "text"),
+    ("callout", "isi", "text"),
+    ("definition", "name", "term"),
+    ("definition", "meaning", "definition"),
+    ("comparison", "left", "left_label"),
+    ("comparison", "right", "right_label"),
+    ("timeline", "items", "entries"),
+    ("toggle", "text", "content"),
+    ("formula", "formula", "latex"),
+    ("code", "source", "code"),
+];
+
+/// The block with its aliased keys renamed, if that makes it valid.
+fn repair_block(block: &alm_parser::ParsedBlock) -> Option<String> {
+    if NOT_GENERATABLE.contains(&block.r#type.as_str()) {
+        return None;
+    }
+    let obj = block.data.as_object()?;
+    let mut fixed = obj.clone();
+    let mut changed = false;
+    for (kind, from, to) in KEY_ALIASES {
+        if *kind == block.r#type && !fixed.contains_key(*to) {
+            if let Some(value) = fixed.remove(*from) {
+                fixed.insert((*to).to_string(), value);
+                changed = true;
+            }
+        }
+    }
+    if !changed {
+        return None;
+    }
+    let data = serde_json::Value::Object(fixed);
+    block_schema::validate(&block.r#type, &data).ok()?;
+    block_to_alm(&block.r#type, &data)
+}
+
+/// A block written back as ALM — one line per key, JSON values inline,
+/// which is the only form the parser reads back.
+fn block_to_alm(kind: &str, data: &serde_json::Value) -> Option<String> {
+    let obj = data.as_object()?;
+    let mut out = format!(":::{kind}\n");
+    for (key, value) in obj {
+        let rendered = match value {
+            serde_json::Value::String(text) => text.clone(),
+            other => serde_json::to_string(other).ok()?,
+        };
+        if rendered.contains('\n') || key.contains(':') {
+            return None;
+        }
+        out.push_str(&format!("{key}: {rendered}\n"));
+    }
+    out.push_str(":::");
+    Some(out)
+}
+
+/// A directive block the schema rejected, turned back into prose.
+/// Losing the formatting is far better than losing the words — but the
+/// words have to stay readable: a table's `rows` demoted to its own
+/// JSON source is what a learner then sees on the page, brackets and
+/// quotes and all. So arrays become lists, rows become one bullet per
+/// row, and nothing is ever emitted as JSON.
+fn demote_directive(block: &alm_parser::ParsedBlock) -> String {
+    let Some(obj) = block.data.as_object() else {
+        return demote_raw(&block.raw_source);
+    };
+    if obj.is_empty() {
+        return demote_raw(&block.raw_source);
+    }
+    let mut out: Vec<String> = Vec::new();
+    for value in obj.values() {
+        match value {
+            serde_json::Value::String(text) if !text.trim().is_empty() => out.push(text.trim().to_string()),
+            serde_json::Value::Array(items) if !items.is_empty() => {
+                let bullets: Vec<String> = items
+                    .iter()
+                    .map(|item| {
+                        let mut parts = Vec::new();
+                        flatten_json(item, &mut parts);
+                        parts.join(" · ")
+                    })
+                    .filter(|line| !line.trim().is_empty())
+                    .map(|line| format!("- {line}"))
+                    .collect();
+                if !bullets.is_empty() {
+                    out.push(bullets.join("\n"));
+                }
+            }
+            serde_json::Value::Object(_) => {
+                let mut parts = Vec::new();
+                flatten_json(value, &mut parts);
+                if !parts.is_empty() {
+                    out.push(parts.join(" · "));
+                }
+            }
+            _ => {}
+        }
+    }
+    if out.is_empty() { demote_raw(&block.raw_source) } else { out.join("\n\n") }
+}
+
+/// Last resort for a block whose body is not `key: value` at all.
+fn demote_raw(raw: &str) -> String {
     raw.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with(":::"))
-        .map(|line| match line.split_once(':') {
-            Some((key, value)) if !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !value.trim().is_empty() => {
-                let value = value.trim();
-                match serde_json::from_str::<serde_json::Value>(value) {
-                    Ok(json @ (serde_json::Value::Array(_) | serde_json::Value::Object(_))) => {
-                        let mut parts = Vec::new();
-                        flatten_json(&json, &mut parts);
-                        parts.join(" · ")
-                    }
-                    _ => value.to_string(),
-                }
-            }
-            _ => line.to_string(),
-        })
-        .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n")
 }
@@ -188,7 +327,7 @@ pub fn sanitize_generated(content: &str) -> String {
     }
     blocks
         .iter()
-        .map(|b| if is_ok(b) { b.raw_source.clone() } else { demote_directive(&b.raw_source) })
+        .map(|b| if is_ok(b) { b.raw_source.clone() } else { repair_block(b).unwrap_or_else(|| demote_directive(b)) })
         .filter(|s| !s.trim().is_empty())
         .collect::<Vec<_>>()
         .join("\n\n")
@@ -249,7 +388,7 @@ mod tests {
     use super::*;
 
     fn section(id: &str, content: &str) -> LessonPlanSection {
-        LessonPlanSection { id: id.to_string(), title: "Judul".to_string(), minutes: Some(5), goal: String::new(), content: content.to_string() }
+        LessonPlanSection { id: id.to_string(), title: "Judul".to_string(), minutes: Some(5), goal: String::new(), content: content.to_string(), checkpoint: None }
     }
 
     #[test]
@@ -293,10 +432,37 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_flattens_json_values_of_a_broken_table() {
+    fn a_table_titled_instead_of_captioned_is_repaired_not_demoted() {
+        // The schema has `caption`; models write `title`. Demoting cost
+        // a whole table over one word — and put its JSON on the page.
+        let src = ":::table\ntitle: Nilai Tempat\nheaders: [\"Nama\", \"Posisi\"]\nrows: [[\"Ratusan\", \"Ke-3\"]]\n:::";
+        let out = sanitize_generated(src);
+        assert!(out.contains(":::table"), "{out}");
+        assert!(out.contains("caption: Nilai Tempat"), "{out}");
+        let blocks = alm_parser::parse(&out).unwrap();
+        assert!(block_schema::validate(&blocks[0].r#type, &blocks[0].data).is_ok());
+    }
+
+    #[test]
+    fn a_demoted_block_never_puts_json_on_the_page() {
+        // `variant: kuning` is not repairable, so this one really is
+        // demoted — but the rows must come out as readable lines.
+        let src = ":::comparison\nleft_label: A\nright_label: B\nrows: [[\"satu\"]]\n:::";
+        let out = sanitize_generated(src);
+        assert!(!out.contains('['), "{out}");
+        assert!(!out.contains('"'), "{out}");
+        assert!(out.contains("- satu"), "{out}");
+    }
+
+    #[test]
+    fn sanitize_rescues_the_words_of_a_ragged_table() {
+        // Ragged rows can't be repaired into a table, so this demotes —
+        // but it demotes to readable lines, not to JSON.
         let src = ":::table\nheaders: [\"A\", \"B\"]\nrows: [[\"1\"]]\n:::";
         let out = sanitize_generated(src);
-        assert!(out.contains("A · B"), "{out}");
+        assert!(out.contains("- A"), "{out}");
+        assert!(out.contains("- 1"), "{out}");
+        assert!(!out.contains('['), "{out}");
         validate_content(&out).unwrap();
     }
 

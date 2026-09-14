@@ -57,6 +57,13 @@ pub fn protected_routes() -> Router<Arc<AppState>> {
         // Aturan Akses & Guard, Attendance Guard, Proctor (migration 0045).
         .route("/module-items/{id}/guards", patch(handlers::item_rules::patch_guards))
         .route("/module-items/{id}/complete", post(handlers::item_rules::post_complete))
+        .route("/content-reports", post(handlers::content_report::post_report))
+        .route("/me/learning-heatmap", get(handlers::learning_heatmap::get_my_heatmap))
+        .route("/module-items/{id}/checkpoints", get(handlers::item_rules::get_checkpoints))
+        .route("/module-items/{id}/sections/{section_id}/checkpoint", post(handlers::item_rules::post_checkpoint))
+        .route("/module-items/{id}/sections/{section_id}/reread", post(handlers::item_rules::post_checkpoint_reread))
+        .route("/module-items/{id}/sections/{section_id}/checkpoint/preview", post(handlers::item_rules::post_checkpoint_preview))
+        .route("/module-items/{id}/sections/{section_id}/checkpoint/preview/grade", post(handlers::item_rules::post_checkpoint_preview_grade))
         .route("/module-items/{id}/progress", get(handlers::item_rules::get_progress))
         .route("/module-items/{id}/progress/{user_id}/approve", post(handlers::item_rules::post_approval))
         .route(

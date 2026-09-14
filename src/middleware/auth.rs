@@ -1,15 +1,16 @@
 use axum::{
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::HeaderMap,
     middleware::Next,
     response::Response,
 };
+use std::net::SocketAddr;
 use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::errors::AppError;
 use crate::models::auth::AuthContext;
-use crate::services::{auth as auth_service, token};
+use crate::services::{auth as auth_service, request_meta, token};
 use crate::state::AppState;
 
 // Port of auth-context.ts's resolveAuthContext, applied as an Axum
@@ -21,6 +22,21 @@ pub async fn auth_middleware(
     next: Next,
 ) -> Result<Response, AppError> {
     let ctx = resolve_auth_context(&state, req.headers()).await?;
+
+    // Admin Pusat "Peserta" — best-effort presence touch, never lets a
+    // DB hiccup fail the actual request. The UPDATE's own WHERE clause
+    // (touch_presence) is what keeps this cheap despite running on
+    // every authenticated request — see its doc comment.
+    let connect_info = req.extensions().get::<ConnectInfo<SocketAddr>>();
+    let meta = request_meta::extract(req.headers(), connect_info);
+    let user_id = ctx.user_id;
+    let pool = state.db.clone();
+    tokio::spawn(async move {
+        if let Err(err) = auth_service::touch_presence(&pool, user_id, &meta).await {
+            tracing::warn!(?err, %user_id, "gagal mencatat presence");
+        }
+    });
+
     req.extensions_mut().insert(ctx);
     Ok(next.run(req).await)
 }

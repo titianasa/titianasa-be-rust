@@ -51,12 +51,22 @@ pub async fn post_attempt(
 }
 
 // POST /lessons/{id}/attempts — P3-004/P6-002 (writing/speaking).
+#[derive(Debug, serde::Deserialize)]
+pub struct LessonAttemptQuery {
+    /// `preview` — sat from /belajar/{id}/preview by an author, reviewer,
+    /// admin or collaborator. Anything else is a learner sitting.
+    #[serde(default)]
+    pub mode: Option<String>,
+}
+
 pub async fn post_lesson_attempt(
     State(state): State<Arc<AppState>>,
     Extension(ctx): Extension<AuthContext>,
     Path(item_id): Path<Uuid>,
+    axum::extract::Query(query): axum::extract::Query<LessonAttemptQuery>,
 ) -> Result<(StatusCode, Json<CreateLessonAttemptResponse>), AppError> {
-    let result = assessment::create_lesson_attempt(&state.db, &ctx, item_id).await?;
+    let preview = query.mode.as_deref() == Some("preview");
+    let result = assessment::create_lesson_attempt(&state.db, &ctx, item_id, preview).await?;
     Ok((StatusCode::CREATED, Json(result)))
 }
 
@@ -77,40 +87,53 @@ pub async fn post_submit(
 
     if let Some(item_id) = attempt.item_id {
         // Phase 37 — every item-anchored attempt is a `quiz` item now
-        // (writing/speaking retired, see migrations/0038). Skill XP is
-        // keyed off the FIRST question group's subtype family when it
-        // maps to an existing xp::skill_xp tier (reading/listening/
-        // grammar/vocabulary); production/interactive subjects don't
-        // have an English-specific skill category, so those fall back
-        // to the same flat tier assessment_xp already uses for an
-        // untyped assessment.
+        // (writing/speaking retired, see migrations/0038). XP follows
+        // xp::quiz_xp: full once on the first pass, small on a retake that
+        // raises the best score, nothing otherwise.
         let quiz_config = sqlx::query_scalar!(r#"select quiz_config from module_items where id = $1"#, item_id)
             .fetch_optional(&state.db)
             .await?
             .ok_or_else(|| AppError::Internal(anyhow::anyhow!("attempt references a missing module item")))?;
-        let skill_category = quiz_config
-            .as_ref()
-            .and_then(|c| c.get("question_groups"))
-            .and_then(|g| g.as_array())
-            .and_then(|groups| groups.first())
-            .and_then(|g| g.get("subtype")).and_then(|v| v.as_str())
-            .and_then(quiz_subtype::find)
-            .and_then(|info| match info.family {
-                quiz_subtype::SubtypeFamily::Reading => Some("reading"),
-                quiz_subtype::SubtypeFamily::Listening => Some("listening"),
-                quiz_subtype::SubtypeFamily::Grammar => Some("grammar"),
-                quiz_subtype::SubtypeFamily::Vocabulary => Some("vocabulary"),
-                quiz_subtype::SubtypeFamily::Production | quiz_subtype::SubtypeFamily::Interactive => None,
-            });
+        // A preview sitting is graded by the real grader, but nothing it
+        // does counts: no XP, no streak, no mission progress.
+        let preview = attempt.is_preview;
+        let passing_score = quiz_config.as_ref().and_then(|c| c.get("passing_score")).and_then(|v| v.as_f64()).unwrap_or(xp::DEFAULT_PASSING_SCORE);
+        // Read BEFORE submit — submit folds this attempt's score into best_score.
+        let previous_best = sqlx::query_scalar!(r#"select best_score from module_item_progress where user_id = $1 and item_id = $2"#, ctx.user_id, item_id)
+            .fetch_optional(&state.db)
+            .await?
+            .flatten();
 
         let quiz_answers = body.quiz_answers.unwrap_or_default();
         let result = quiz_attempt::submit_quiz_attempt(&state.db, &state.config, state.ai_provider.as_ref(), state.text_ai_provider.as_ref(), state.storage.as_ref(), &ctx, attempt_id, &quiz_answers).await?;
 
-        let xp_amount = skill_category.and_then(xp::skill_xp).unwrap_or(20);
-        xp::award_xp(&state.db, ctx.user_id, xp_amount, "quiz_completed", Some(&format!("attempt:{attempt_id}")), skill_category).await?;
-        streak::record_activity(&state.db, ctx.user_id, chrono::Utc::now()).await?;
-        achievement::check_and_award(&state.db, ctx.user_id, &achievement::ActivityContext { skill_category: skill_category.map(String::from), question_ids: vec![] }).await?;
-        daily_mission::record_progress(&state.db, ctx.user_id, skill_category, chrono::Utc::now()).await?;
+        // Skill category from the questions actually graded (a pooled
+        // "Latihan 10 soal" has no groups of its own). Was read from a
+        // nonexistent `subtype` key on the group, so it was always None.
+        let skill_category = result.results.first().and_then(|r| quiz_subtype::find(&r.subtype)).and_then(|info| match info.family {
+            quiz_subtype::SubtypeFamily::Reading => Some("reading"),
+            quiz_subtype::SubtypeFamily::Listening => Some("listening"),
+            quiz_subtype::SubtypeFamily::Grammar => Some("grammar"),
+            quiz_subtype::SubtypeFamily::Vocabulary => Some("vocabulary"),
+            quiz_subtype::SubtypeFamily::Production | quiz_subtype::SubtypeFamily::Interactive => None,
+        });
+
+        if let Some(score) = result.score.filter(|_| !preview) {
+            match xp::quiz_xp(result.results.len(), passing_score, previous_best, score) {
+                Some(xp::QuizXp::FirstPass { amount }) => {
+                    xp::award_xp(&state.db, ctx.user_id, amount, "quiz_passed", Some(&format!("quiz_pass:{}:{item_id}", ctx.user_id)), skill_category).await?;
+                }
+                Some(xp::QuizXp::Improved { amount, new_best }) => {
+                    xp::award_xp(&state.db, ctx.user_id, amount, "quiz_improved", Some(&format!("quiz_improve:{}:{item_id}:{new_best}", ctx.user_id)), skill_category).await?;
+                }
+                None => {}
+            }
+        }
+        if !preview {
+            streak::record_activity(&state.db, ctx.user_id, chrono::Utc::now()).await?;
+            achievement::check_and_award(&state.db, ctx.user_id, &achievement::ActivityContext { skill_category: skill_category.map(String::from), question_ids: vec![] }).await?;
+            daily_mission::record_progress(&state.db, ctx.user_id, skill_category, chrono::Utc::now()).await?;
+        }
 
         return Ok(Json(serde_json::to_value(result).map_err(|e| AppError::Internal(e.into()))?));
     }

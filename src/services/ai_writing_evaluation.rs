@@ -117,7 +117,7 @@ pub async fn run_writing_evaluation(pool: &PgPool, ai: &dyn AIProvider, model: &
     let (system_prompt, user_prompt) = writing_evaluation_prompt(answer_text);
     let max_tokens = resolve_max_tokens(pool, model, 1024).await;
 
-    let generation = match ai.generate(GenerationRequest { model: model.to_string(), system_prompt, user_prompt, temperature: 0.3, max_tokens, image_url: None, json_mode: true }).await {
+    let generation = match ai.generate(GenerationRequest { model: model.to_string(), system_prompt, user_prompt, temperature: 0.3, max_tokens, image_url: None, json_mode: true, thinking_budget: None, allow_partial: false }).await {
         Ok(g) => g,
         Err(e) => {
             tracing::warn!(error = ?e, "writing evaluation generation failed");

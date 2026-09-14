@@ -442,31 +442,46 @@ pub enum Stage {
     Sma,
     Kuliah,
     Pascasarjana,
+    /// Adults outside school: CPNS/BUMN selection, international language
+    /// tests, professional training. Not a younger or older "kuliah" —
+    /// the register is plain and direct, and the thinking is applied.
+    Umum,
 }
 
 impl Stage {
     pub fn infer(level: &str) -> Option<Self> {
         let l = level.to_lowercase();
         let has_word = |w: &str| l.split(|c: char| !c.is_alphanumeric()).any(|t| t == w);
-        // The library's own staging first — it is the most specific.
+        // An explicit jenjang in the name wins. The library's "Tahap N" is
+        // only a number WITHIN one subject — Fisika's Tahap 2 is SMA and
+        // its Tahap 5 is S1 — so reading it first sent SMA physics to the
+        // model as SMP and university physics as postgraduate.
+        if l.contains("pascasarjana") || has_word("s2") || has_word("s3") || l.contains("magister") || l.contains("doktor") {
+            return Some(Self::Pascasarjana);
+        }
+        if has_word("s1") || l.contains("kuliah") || l.contains("universitas") || l.contains("mahasiswa") || l.contains("perguruan tinggi") {
+            return Some(Self::Kuliah);
+        }
+        if ["cpns", "asn", "bumn", "skd", "skb", "twk", "tiu", "tkp", "ielts", "toefl", "toeic", "profesional", "dewasa", "umum"].iter().any(|w| has_word(w)) {
+            return Some(Self::Umum);
+        }
+        if has_word("sma") || has_word("smk") || has_word("ma") || l.contains("utbk") || l.contains("snbt") || l.contains("fase e") || l.contains("fase f") {
+            return Some(Self::Sma);
+        }
+        if has_word("smp") || has_word("mts") || l.contains("fase d") {
+            return Some(Self::Smp);
+        }
+        if has_word("sd") || has_word("mi") || l.contains("fase a") || l.contains("fase b") || l.contains("fase c") {
+            return Some(Self::Sd);
+        }
+        // No jenjang named: Matematika's own staging, the one subject whose
+        // Tahap numbers do line up with school levels.
         for (tahap, stage) in [("1", Self::Sd), ("2", Self::Smp), ("3", Self::Sma), ("4", Self::Kuliah), ("5", Self::Pascasarjana)] {
-            if l.contains(&format!("tahap {tahap}")) {
+            if has_word("tahap") && l.contains(&format!("tahap {tahap}")) {
                 return Some(stage);
             }
         }
-        if l.contains("pascasarjana") || has_word("s2") || has_word("s3") || l.contains("magister") || l.contains("doktor") {
-            Some(Self::Pascasarjana)
-        } else if has_word("s1") || l.contains("kuliah") || l.contains("universitas") || l.contains("mahasiswa") || l.contains("perguruan tinggi") {
-            Some(Self::Kuliah)
-        } else if has_word("sma") || has_word("smk") || has_word("ma") || l.contains("utbk") || l.contains("snbt") {
-            Some(Self::Sma)
-        } else if has_word("smp") || has_word("mts") {
-            Some(Self::Smp)
-        } else if has_word("sd") || has_word("mi") {
-            Some(Self::Sd)
-        } else {
-            None
-        }
+        None
     }
 
     pub fn label(self) -> &'static str {
@@ -476,6 +491,7 @@ impl Stage {
             Self::Sma => "SMA/SMK/MA",
             Self::Kuliah => "perguruan tinggi (S1)",
             Self::Pascasarjana => "pascasarjana",
+            Self::Umum => "umum/dewasa (seleksi kerja, tes, profesional)",
         }
     }
 
@@ -489,6 +505,8 @@ impl Stage {
             Some(Self::Sma) => [5, 20, 35, 25, 10, 5],
             Some(Self::Kuliah) => [0, 15, 30, 30, 15, 10],
             Some(Self::Pascasarjana) => [0, 5, 20, 35, 25, 15],
+            // Selection tests reward applying and analysing, not recall.
+            Some(Self::Umum) => [5, 20, 35, 30, 10, 0],
             // Unknown jenjang: a middle-of-the-road paper.
             None => [10, 25, 35, 20, 10, 0],
         }
@@ -504,7 +522,7 @@ const DIFFICULTY_WEIGHTS: [u32; 3] = [30, 50, 20];
 /// Splits `count` questions across `weights` by largest remainder, so
 /// the counts always add up exactly and a zero weight always gets zero.
 /// Ties go to the earlier (lower) level.
-fn apportion(weights: &[u32], count: i64) -> Vec<i64> {
+pub(crate) fn apportion(weights: &[u32], count: i64) -> Vec<i64> {
     let count = count.max(0);
     let total: u32 = weights.iter().sum();
     if total == 0 {
@@ -536,6 +554,21 @@ pub fn target_spread(level: &str, count: i64) -> (Option<Stage>, Vec<(BloomLevel
 /// The taxonomy block, spelled out for the generator prompt. Kept next
 /// to the enums so a new level can never be added to one without the
 /// model being told about it.
+/// Stem readability per jenjang — the question-side counterpart of
+/// `lesson_plan_ai::readability_rules`. The pilot's SD bank came back
+/// with 45-word stems ("Di atas meja mula-mula terdapat 4 buah apel utuh
+/// di dalam keranjang. Doni dan ketiga adiknya masing-masing...") because
+/// nothing ever told the model how long a 10-year-old's question may be.
+pub fn stem_readability(level: &str) -> &'static str {
+    match Stage::infer(level) {
+        Some(Stage::Sd) => "- BAHASA SOAL (SD/MI): stem maksimal 20 kata dan satu kalimat konteks; pilihan jawaban maksimal 8 kata. Pakai kata sehari-hari dan nama/benda yang dikenal anak. Jangan memakai istilah di luar jenjang.",
+        Some(Stage::Smp) => "- BAHASA SOAL (SMP/MTs): stem maksimal 30 kata. Istilah teknis boleh bila memang materinya.",
+        Some(Stage::Sma) => "- BAHASA SOAL (SMA/SMK/MA): stem maksimal 45 kata, boleh memakai stimulus singkat.",
+        Some(Stage::Umum) => "- BAHASA SOAL (umum/dewasa): stem maksimal 60 kata, boleh memakai stimulus kasus seperti soal seleksi; sapa dengan \"Anda\" bila perlu sapaan.",
+        _ => "- BAHASA SOAL: tulis stem sependek mungkin tanpa menghilangkan informasi yang dibutuhkan.",
+    }
+}
+
 pub fn prompt_rules(level: &str, count: i64) -> String {
     let definitions = BloomLevel::ALL
         .iter()
@@ -564,13 +597,15 @@ Rencanakan sebaran ini SEBELUM menulis, lalu tulis soal yang BENAR-BENAR menuntu
     };
 
     format!(
-        "- Setiap soal WAJIB punya `taxonomy` berisi `difficulty` (\"mudah\" | \"sedang\" | \"sulit\") dan `bloom` (\"c1\"..\"c6\"). JANGAN menulis LOTS/MOTS/HOTS — itu diturunkan otomatis dari `bloom`.\n\
+        "{readability}\n\
+- Setiap soal WAJIB punya `taxonomy` berisi `difficulty` (\"mudah\" | \"sedang\" | \"sulit\") dan `bloom` (\"c1\"..\"c6\"). JANGAN menulis LOTS/MOTS/HOTS — itu diturunkan otomatis dari `bloom`.\n\
 - Tentukan `bloom` dari apa yang DILAKUKAN siswa untuk sampai ke jawaban, bukan dari panjang atau konteks soalnya:\n{definitions}\n\
 - Dua kesalahan pelabelan yang paling sering, hindari:\n  \
 (a) Soal cerita atau soal banyak langkah dilabeli C4. Bila siswa hanya menjalankan prosedur yang sudah diajarkan, itu C3, serumit apa pun ceritanya.\n  \
 (b) Soal yang jawabannya bisa disalin atau dikenali langsung dari bacaan dilabeli C2 ke atas. Itu C1.\n\
 - Tentukan `difficulty` SENDIRI, terpisah dari `bloom`, dengan memperkirakan berapa persen siswa sasaran yang akan menjawab benar:\n{difficulty}\n  \
-Keduanya sering tidak searah: soal C1 tentang istilah yang jarang dipakai bisa sulit, soal C4 atas data dua baris bisa mudah. Jangan menyamakan C1–C2 dengan mudah dan C4 ke atas dengan sulit.{spread}"
+Keduanya sering tidak searah: soal C1 tentang istilah yang jarang dipakai bisa sulit, soal C4 atas data dua baris bisa mudah. Jangan menyamakan C1–C2 dengan mudah dan C4 ke atas dengan sulit.{spread}",
+        readability = stem_readability(level),
     )
 }
 
@@ -659,6 +694,20 @@ mod tests {
         // A word that merely CONTAINS "sd"/"ma" must not match — "masa"
         // is not Madrasah Aliyah.
         assert_eq!(Stage::infer("materi masa kini"), None);
+    }
+
+    #[test]
+    fn an_explicit_jenjang_beats_the_tahap_number() {
+        // Only Matematika's Tahap numbers line up with school levels.
+        assert_eq!(Stage::infer("Tahap 2 — Mekanika (SMA)"), Some(Stage::Sma));
+        assert_eq!(Stage::infer("Tahap 5 — Fisika Tingkat Universitas"), Some(Stage::Kuliah));
+        assert_eq!(Stage::infer("Tahap 4 — Akuntansi Kejuruan (SMK)"), Some(Stage::Sma));
+        assert_eq!(Stage::infer("Tahap 1 — Dasar Agama Hindu (SD)"), Some(Stage::Sd));
+        assert_eq!(Stage::infer("Tahap 3 — Tafsir & Hadis Tematik (MA)"), Some(Stage::Sma));
+        assert_eq!(Stage::infer("Tahap 4 — Tes Wawasan Kebangsaan (TWK)"), Some(Stage::Umum));
+        assert_eq!(Stage::infer("Tahap B — IPA SMP"), Some(Stage::Smp));
+        assert_eq!(Stage::infer("Tahap 5 — Matematika Pascasarjana"), Some(Stage::Pascasarjana));
+        assert_eq!(Stage::infer("Tahap 3 — Matematika Lanjut"), Some(Stage::Sma));
     }
 
     #[test]

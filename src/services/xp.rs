@@ -23,6 +23,39 @@ pub fn skill_xp(skill_category: &str) -> Option<i32> {
 // rather than 0, still real practice.
 pub const UNTAGGED_QUESTION_XP: i32 = 5;
 
+/// XP for finishing a module quiz. Paid ONCE in full, the first time the
+/// learner passes; afterwards a retake only pays a small amount when it
+/// raises their best score. A failed attempt, or a retake that doesn't
+/// beat the best, pays nothing — replaying the same quiz is no longer a
+/// way to farm XP (it used to pay a flat 20 on every submit).
+///
+/// Size matters: "Latihan 50 soal" is worth five times "Latihan 10 soal".
+#[derive(Debug, Clone, PartialEq)]
+pub enum QuizXp {
+    FirstPass { amount: i32 },
+    Improved { amount: i32, new_best: i64 },
+}
+
+pub const QUIZ_XP_PER_QUESTION: i32 = 2;
+pub const DEFAULT_PASSING_SCORE: f64 = 70.0;
+
+pub fn quiz_xp(question_count: usize, passing_score: f64, previous_best: Option<f64>, score: f64) -> Option<QuizXp> {
+    let base = QUIZ_XP_PER_QUESTION * question_count as i32;
+    if base == 0 {
+        return None;
+    }
+    let passed_before = previous_best.is_some_and(|b| b >= passing_score);
+    if !passed_before {
+        return (score >= passing_score).then_some(QuizXp::FirstPass { amount: base });
+    }
+    let best = previous_best.unwrap_or(0.0);
+    if score <= best {
+        return None;
+    }
+    let amount = ((base as f64) * 0.2 * (score - best) / 100.0).round().max(1.0) as i32;
+    Some(QuizXp::Improved { amount, new_best: score.floor() as i64 })
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct XpEventSummary {
     pub amount: i64,
@@ -141,4 +174,29 @@ pub async fn get_weekly_event_count(pool: &PgPool, user_id: Uuid, since: DateTim
     .fetch_one(pool)
     .await?;
     Ok(count)
+}
+
+#[cfg(test)]
+mod quiz_xp_tests {
+    use super::*;
+
+    #[test]
+    fn the_first_pass_pays_in_full_scaled_by_paper_size() {
+        assert_eq!(quiz_xp(10, 70.0, None, 80.0), Some(QuizXp::FirstPass { amount: 20 }));
+        assert_eq!(quiz_xp(50, 70.0, Some(40.0), 70.0), Some(QuizXp::FirstPass { amount: 100 }), "earlier failures don't use up the first pass");
+    }
+
+    #[test]
+    fn failing_pays_nothing() {
+        assert_eq!(quiz_xp(25, 70.0, None, 69.9), None);
+    }
+
+    #[test]
+    fn a_retake_pays_only_when_it_beats_the_best() {
+        assert_eq!(quiz_xp(10, 70.0, Some(80.0), 80.0), None, "same score again is not progress");
+        assert_eq!(quiz_xp(10, 70.0, Some(80.0), 60.0), None);
+        // 20 base × 0.2 × 20 points = 0.8 → rounds up to the 1 XP floor.
+        assert_eq!(quiz_xp(10, 70.0, Some(80.0), 100.0), Some(QuizXp::Improved { amount: 1, new_best: 100 }));
+        assert_eq!(quiz_xp(50, 70.0, Some(70.0), 100.0), Some(QuizXp::Improved { amount: 6, new_best: 100 }));
+    }
 }

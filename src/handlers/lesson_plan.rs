@@ -41,5 +41,13 @@ pub async fn post_translate_lesson_plan(
     ValidatedJson(body): ValidatedJson<TranslateLessonPlanRequest>,
 ) -> Result<Json<TranslatePlanResponse>, AppError> {
     let model = crate::services::ai_settings::resolve(&state.db, &state.config, "lesson_generation").await?.model_id;
-    Ok(Json(lesson_plan_ai::translate_plan(&state.db, state.text_ai_provider.as_ref(), &model, &ctx, body).await?))
+    let item_id = body.item_id;
+    let mut response = lesson_plan_ai::translate_plan(&state.db, state.text_ai_provider.as_ref(), &model, &ctx, body).await?;
+    // A learner reads the translation — checkpoint pools carry answer keys.
+    if !crate::services::module_item::sees_answer_key(&state.db, &ctx, item_id).await? {
+        for section in &mut response.lesson_plan.sections {
+            section.checkpoint = None;
+        }
+    }
+    Ok(Json(response))
 }

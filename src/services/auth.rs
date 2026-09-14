@@ -4,6 +4,7 @@ use uuid::Uuid;
 
 use crate::errors::AppError;
 use crate::models::responses::auth::{LoginResponse, RefreshResponse, RoleEntry, UserSummary};
+use crate::services::request_meta::RequestMeta;
 use crate::services::{google_oauth::GoogleTokenVerifier, token};
 use crate::Config;
 
@@ -206,7 +207,7 @@ async fn find_valid_refresh_token_user(pool: &PgPool, token_hash: &str) -> Resul
     Ok(user_id)
 }
 
-async fn issue_tokens(pool: &PgPool, config: &Config, user: &UserRow) -> Result<LoginResponse, AppError> {
+async fn issue_tokens(pool: &PgPool, config: &Config, user: &UserRow, meta: &RequestMeta) -> Result<LoginResponse, AppError> {
     let access_token = token::issue_access_token(
         &config.jwt_access_secret,
         &user.id.to_string(),
@@ -219,11 +220,61 @@ async fn issue_tokens(pool: &PgPool, config: &Config, user: &UserRow) -> Result<
     let expires_at = Utc::now() + chrono::Duration::days(config.refresh_token_ttl_days);
     insert_refresh_token(pool, user.id, &hash, expires_at).await?;
 
+    // Admin Pusat "Peserta" — login history + an immediate presence
+    // touch, so "online sekarang" doesn't wait for the first
+    // authenticated request after this one.
+    if let Err(err) = record_login_event(pool, user.id, meta).await {
+        tracing::warn!(?err, user_id = %user.id, "gagal mencatat login event");
+    }
+    if let Err(err) = touch_presence(pool, user.id, meta).await {
+        tracing::warn!(?err, user_id = %user.id, "gagal mencatat presence saat login");
+    }
+
     Ok(LoginResponse {
         access_token,
         refresh_token: raw_refresh,
         user: UserSummary { id: user.id, email: user.email.clone(), name: user.name.clone() },
     })
+}
+
+async fn record_login_event(pool: &PgPool, user_id: Uuid, meta: &RequestMeta) -> Result<(), AppError> {
+    let ip_text = meta.ip.map(|ip| ip.to_string());
+    sqlx::query!(
+        r#"insert into user_login_events (user_id, ip, user_agent, device_label) values ($1, $2, $3, $4)"#,
+        user_id,
+        ip_text,
+        meta.user_agent,
+        meta.device_label,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// Admin Pusat "Peserta" — cheap enough to call on every authenticated
+// request (middleware/auth.rs) because the UPDATE's own WHERE clause
+// skips the write entirely when the row is still fresh (<2 minutes),
+// so in practice this only actually touches disk a couple of times a
+// minute per active user, not once a request.
+pub async fn touch_presence(pool: &PgPool, user_id: Uuid, meta: &RequestMeta) -> Result<(), AppError> {
+    let ip_text = meta.ip.map(|ip| ip.to_string());
+    sqlx::query!(
+        r#"insert into user_presence (user_id, last_seen_at, last_ip, last_user_agent, last_device_label)
+           values ($1, now(), $2, $3, $4)
+           on conflict (user_id) do update
+             set last_seen_at = excluded.last_seen_at,
+                 last_ip = excluded.last_ip,
+                 last_user_agent = excluded.last_user_agent,
+                 last_device_label = excluded.last_device_label
+             where user_presence.last_seen_at < now() - interval '2 minutes'"#,
+        user_id,
+        ip_text,
+        meta.user_agent,
+        meta.device_label,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 // Port of auth_service.ts's googleCallback.
@@ -232,6 +283,7 @@ pub async fn google_callback(
     verifier: &GoogleTokenVerifier,
     config: &Config,
     id_token: &str,
+    meta: &RequestMeta,
 ) -> Result<LoginResponse, AppError> {
     let claims = verifier.verify(id_token, &config.google_client_id).await?;
 
@@ -254,7 +306,7 @@ pub async fn google_callback(
         assign_default_student_role(pool, user.id).await?;
     }
 
-    issue_tokens(pool, config, &user).await
+    issue_tokens(pool, config, &user, meta).await
 }
 
 // Port of auth_service.ts's refresh.

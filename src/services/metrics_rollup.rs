@@ -176,6 +176,117 @@ async fn rollup_ai(pool: &PgPool, day: NaiveDate) -> Result<(), AppError> {
     Ok(())
 }
 
+// Admin Pusat "Peserta" (ADR-0014 §2, the piece deferred until Fase 39's
+// learning_events pipeline had real data). DAU/WAU/MAU all read from the
+// SAME bounded scan of `learning_events` via 3 `count(distinct ...)
+// filter (...)` clauses rather than 3 separate queries — the outer
+// WHERE on raw `created_at` is what lets Postgres prune partitions
+// (learning_events is `partition by range (created_at)`); the FILTERs
+// then narrow to the exact WIB day/7-day/30-day windows.
+async fn rollup_participants(pool: &PgPool, day: NaiveDate) -> Result<(), AppError> {
+    sqlx::query!(
+        r#"insert into metrics_daily_participants (day, dau, wau, mau)
+           select $1::date,
+             count(distinct user_id) filter (where (created_at at time zone 'Asia/Jakarta')::date = $1::date),
+             count(distinct user_id) filter (where (created_at at time zone 'Asia/Jakarta')::date > $1::date - 7),
+             count(distinct user_id) filter (where (created_at at time zone 'Asia/Jakarta')::date > $1::date - 30)
+           from learning_events
+           where created_at >= (($1::date - 30)::timestamp - interval '7 hours')
+             and created_at < (($1::date + 1)::timestamp - interval '7 hours')
+           on conflict (day) do update set dau = excluded.dau, wau = excluded.wau, mau = excluded.mau"#,
+        day,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Per WIB day × question (migrations/0058) — what every Admin Pusat
+/// heatmap level and "soal tersulit" sums over. A question's placement
+/// and labels are taken from its most recent answer that day, so a
+/// question moved between babs mid-day lands where it now is.
+async fn rollup_questions(pool: &PgPool, day: NaiveDate) -> Result<(), AppError> {
+    sqlx::query!(
+        r#"with day_facts as (
+             select * from question_answer_facts
+             where answered_at >= ($1::date::timestamp - interval '7 hours')
+               and answered_at < (($1::date + 1)::timestamp - interval '7 hours')
+           ),
+           latest as (
+             select distinct on (question_uid) question_uid, content_item_id, subject_id, folder_path, module_id, bab_id, subtype, difficulty, bloom
+             from day_facts order by question_uid, answered_at desc
+           ),
+           counts as (
+             select question_uid, count(*)::int as answered, (count(*) filter (where correct is not null))::int as graded,
+                    (count(*) filter (where correct))::int as correct, count(distinct user_id)::int as learners
+             from day_facts group by question_uid
+           )
+           insert into metrics_daily_question
+             (day, question_uid, content_item_id, subject_id, folder_path, module_id, bab_id, subtype, difficulty, bloom, answered, graded, correct, learners)
+           select $1::date, l.question_uid, l.content_item_id, l.subject_id, l.folder_path, l.module_id, l.bab_id, l.subtype, l.difficulty, l.bloom,
+                  c.answered, c.graded, c.correct, c.learners
+           from latest l join counts c using (question_uid)
+           on conflict (day, question_uid) do update set
+             content_item_id = excluded.content_item_id, subject_id = excluded.subject_id, folder_path = excluded.folder_path,
+             module_id = excluded.module_id, bab_id = excluded.bab_id, subtype = excluded.subtype, difficulty = excluded.difficulty,
+             bloom = excluded.bloom, answered = excluded.answered, graded = excluded.graded, correct = excluded.correct, learners = excluded.learners"#,
+        day,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Weekly retention cohorts, always relative to TODAY (like
+/// `rollup_content` — not part of the "last 3 days" per-day loop).
+/// Cohort weeks are WIB Monday-aligned (`date_trunc('week', ...)`); a
+/// user is "active" `weeks_since_signup` weeks after signing up if they
+/// have ANY `learning_events` row in that week. `active_weeks` is
+/// precomputed once (a bounded distinct scan, partition-pruned via the
+/// raw `created_at` range) rather than joined per-offset, which is what
+/// keeps this a single bounded query instead of 12 cohorts × 9 offsets
+/// worth of separate scans.
+async fn rollup_retention(pool: &PgPool) -> Result<(), AppError> {
+    let day = wib_today();
+    sqlx::query!(
+        r#"with cohorts as (
+             select date_trunc('week', (created_at at time zone 'Asia/Jakarta'))::date as cohort_week, id as user_id
+             from users
+             where (created_at at time zone 'Asia/Jakarta')::date >= $1::date - 84
+               and (created_at at time zone 'Asia/Jakarta')::date <= $1::date
+           ),
+           cohort_sizes as (
+             select cohort_week, count(*)::int as cohort_size from cohorts group by cohort_week
+           ),
+           active_weeks as (
+             select distinct user_id, date_trunc('week', (created_at at time zone 'Asia/Jakarta'))::date as active_week
+             from learning_events
+             where created_at >= (($1::date - 84)::timestamp - interval '7 hours')
+               and created_at < (($1::date + 1)::timestamp - interval '7 hours')
+           ),
+           offsets as (select generate_series(0, 8) as weeks_since_signup),
+           active_counts as (
+             select c.cohort_week, o.weeks_since_signup, count(distinct c.user_id)::int as active_users
+             from cohorts c
+             join offsets o on true
+             join active_weeks aw on aw.user_id = c.user_id
+               and aw.active_week = c.cohort_week + (o.weeks_since_signup * 7)
+             group by c.cohort_week, o.weeks_since_signup
+           )
+           insert into metrics_weekly_retention (cohort_week, weeks_since_signup, cohort_size, active_users)
+           select cs.cohort_week, o.weeks_since_signup, cs.cohort_size, coalesce(ac.active_users, 0)
+           from cohort_sizes cs
+           cross join offsets o
+           left join active_counts ac on ac.cohort_week = cs.cohort_week and ac.weeks_since_signup = o.weeks_since_signup
+           on conflict (cohort_week, weeks_since_signup) do update set
+             cohort_size = excluded.cohort_size, active_users = excluded.active_users"#,
+        day,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 struct TopicTahap {
     topic_id: uuid::Uuid,
     subject_id: uuid::Uuid,
@@ -329,6 +440,8 @@ pub async fn rollup_day(pool: &PgPool, day: NaiveDate) -> Result<(), AppError> {
     rollup_subscriptions(pool, day).await?;
     rollup_users(pool, day).await?;
     rollup_ai(pool, day).await?;
+    rollup_participants(pool, day).await?;
+    rollup_questions(pool, day).await?;
     Ok(())
 }
 
@@ -341,11 +454,12 @@ pub async fn run(pool: &PgPool) -> Result<(), AppError> {
         rollup_day(pool, today - chrono::Duration::days(offset)).await?;
     }
     rollup_content(pool).await?;
+    rollup_retention(pool).await?;
     Ok(())
 }
 
-fn job_handler(pool: PgPool, _payload: serde_json::Value) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
-    Box::pin(async move { run(&pool).await.map_err(|e| e.to_string()) })
+fn job_handler(ctx: crate::services::job_queue::JobContext, _payload: serde_json::Value) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
+    Box::pin(async move { run(&ctx.pool).await.map_err(|e| e.to_string()) })
 }
 
 pub const JOB_TYPE: &str = "metrics_rollup";
@@ -390,6 +504,9 @@ pub async fn backfill(pool: &PgPool) -> Result<BackfillReport, AppError> {
         day += chrono::Duration::days(1);
         count += 1;
     }
+    // Not part of the day loop — always "last 12 weeks as of today",
+    // same as rollup_content's "always today" — one call is enough.
+    rollup_retention(pool).await?;
 
     Ok(BackfillReport { earliest_day: Some(earliest_day), days_processed: count })
 }

@@ -6,10 +6,11 @@ use uuid::Uuid;
 use crate::errors::AppError;
 use crate::extract::ValidatedJson;
 use crate::models::auth::AuthContext;
-use crate::models::requests::admin::{AuditLogQuery, MetricsPeriodQuery};
+use crate::models::requests::admin::{AuditLogQuery, MetricsPeriodQuery, ParticipantSearchQuery};
 use crate::models::responses::admin::AuditLogListResponse;
 use crate::services::admin_audit;
 use crate::services::admin_metrics::{self, KurikulumResponse, OperasionalAiResponse, OrganisasiResponse, PenjualanResponse, RingkasanResponse};
+use crate::services::admin_participants::{self, ParticipantDetailResponse, ParticipantSummary, PesertaResponse};
 use crate::services::ai_settings::{self, CatalogEntry, PatchCatalogInput, RoleSettingRow, RoleTestResult, SaveRoleInput};
 use crate::services::permissions::{require_permission, Action, Resource};
 use crate::state::AppState;
@@ -38,6 +39,11 @@ pub async fn patch_ai_catalog(
     ValidatedJson(body): ValidatedJson<PatchCatalogInput>,
 ) -> Result<Json<CatalogEntry>, AppError> {
     Ok(Json(ai_settings::patch_catalog_entry(&state.db, &ctx, id, body).await?))
+}
+
+// POST /admin/ai/catalog
+pub async fn post_ai_catalog(State(state): State<Arc<AppState>>, Extension(ctx): Extension<AuthContext>, Json(body): Json<ai_settings::CreateCatalogInput>) -> Result<(axum::http::StatusCode, Json<CatalogEntry>), AppError> {
+    Ok((axum::http::StatusCode::CREATED, Json(ai_settings::create_catalog_entry(&state.db, &ctx, body).await?)))
 }
 
 // GET /admin/ai/roles
@@ -86,4 +92,20 @@ pub async fn get_metrics_operasional_ai(State(state): State<Arc<AppState>>, Exte
 // GET /admin/metrics/organisasi
 pub async fn get_metrics_organisasi(State(state): State<Arc<AppState>>, Extension(ctx): Extension<AuthContext>) -> Result<Json<OrganisasiResponse>, AppError> {
     Ok(Json(admin_metrics::organisasi(&state.db, &ctx).await?))
+}
+
+// GET /admin/metrics/peserta?from&to
+pub async fn get_metrics_peserta(State(state): State<Arc<AppState>>, Extension(ctx): Extension<AuthContext>, Query(query): Query<MetricsPeriodQuery>) -> Result<Json<PesertaResponse>, AppError> {
+    let (default_from, default_to) = admin_metrics::default_period();
+    Ok(Json(admin_participants::peserta(&state.db, &ctx, query.from.unwrap_or(default_from), query.to.unwrap_or(default_to)).await?))
+}
+
+// GET /admin/participants/search?q=&limit=
+pub async fn search_participants(State(state): State<Arc<AppState>>, Extension(ctx): Extension<AuthContext>, Query(query): Query<ParticipantSearchQuery>) -> Result<Json<Vec<ParticipantSummary>>, AppError> {
+    Ok(Json(admin_participants::search_participants(&state.db, &ctx, &query.q, query.limit.unwrap_or(20)).await?))
+}
+
+// GET /admin/participants/{user_id}
+pub async fn get_participant_detail(State(state): State<Arc<AppState>>, Extension(ctx): Extension<AuthContext>, Path(user_id): Path<Uuid>) -> Result<Json<ParticipantDetailResponse>, AppError> {
+    Ok(Json(admin_participants::participant_detail(&state.db, &ctx, user_id).await?))
 }

@@ -38,6 +38,11 @@ thiserror = "1"
 dotenvy = "0.15"
 async-trait = "0.1"
 
+# Admin Pusat "Peserta" — User-Agent -> device label for the presence
+# touch in middleware/auth.rs. Pure pattern matching, no external data
+# file/network call, cheap enough for the hot path.
+woothee = "0.13"
+
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

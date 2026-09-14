@@ -18,3 +18,10 @@ pub struct MetricsPeriodQuery {
     pub from: Option<chrono::NaiveDate>,
     pub to: Option<chrono::NaiveDate>,
 }
+
+// Peserta — GET /admin/participants/search?q=
+#[derive(Debug, serde::Deserialize)]
+pub struct ParticipantSearchQuery {
+    pub q: String,
+    pub limit: Option<i64>,
+}

@@ -213,8 +213,13 @@ async fn subscriptions_rollup_computes_new_active_and_churned(pool: PgPool) {
     .unwrap();
 
     // A subscription whose period ended TODAY, never renewed -> churned.
+    // Anchored one second into today's WIB day rather than "an hour ago":
+    // between 00:00 and 01:00 WIB an hour ago is YESTERDAY, and the test
+    // failed for that one hour every day.
     sqlx::query!(
-        r#"insert into subscriptions (user_id, tier, status, current_period_start, current_period_end) values ($1, 'pro', 'active', now() - interval '31 days', now() - interval '1 hour')"#,
+        r#"insert into subscriptions (user_id, tier, status, current_period_start, current_period_end)
+           values ($1, 'pro', 'active', now() - interval '31 days',
+                   ((now() at time zone 'Asia/Jakarta')::date + interval '1 second') at time zone 'Asia/Jakarta')"#,
         churned_user
     )
     .execute(&pool)

@@ -56,7 +56,7 @@ pub async fn evaluate(pool: &PgPool, config: &Config, ai: &dyn AIProvider, user_
     let (system_prompt, user_prompt) = grammar_evaluation_prompt(text);
     let model = crate::services::ai_settings::resolve(pool, config, "grammar_evaluation").await?.model_id;
     let max_tokens = resolve_max_tokens(pool, &model, 512).await;
-    let request = GenerationRequest { model: model.clone(), system_prompt, user_prompt, temperature: 0.0, max_tokens, image_url: None, json_mode: true };
+    let request = GenerationRequest { model: model.clone(), system_prompt, user_prompt, temperature: 0.0, max_tokens, image_url: None, json_mode: true, thinking_budget: None, allow_partial: false };
 
     let ai_task_id = Uuid::new_v4();
 

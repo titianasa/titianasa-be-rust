@@ -309,7 +309,7 @@ pub async fn submit_session(
         return Err(AppError::Conflict("canvas_session_already_closed"));
     }
 
-    let attempt = crate::services::assessment::create_lesson_attempt(pool, ctx, session.item_id).await?;
+    let attempt = crate::services::assessment::create_lesson_attempt(pool, ctx, session.item_id, false).await?;
     let result = crate::services::ai_writing_evaluation::submit_writing_attempt(pool, ai, model, ctx, attempt.attempt_id, &session.content).await?;
     close_session(pool, session_id, attempt.attempt_id).await?;
     Ok(result)

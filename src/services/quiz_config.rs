@@ -270,6 +270,23 @@ pub struct QuizQuestion {
     pub explanation: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skill_codes: Vec<String>,
+    /// Order constraints a shuffled paper must respect (see
+    /// `detect_order_constraints`). `choices_fixed`: the choices only
+    /// make sense in their authored order and letters — "Semua benar",
+    /// "A dan C", an ascending list of numbers. `order_locked`: the stem
+    /// leans on the question before it ("berdasarkan soal sebelumnya"),
+    /// so the two travel together and keep their order. `None` = not
+    /// yet evaluated; an author's explicit `false` is never overwritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choices_fixed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_locked: Option<bool>,
+    /// The Modul Belajar section (`LessonPlanSection.id`) this question
+    /// was written from — lets a draw spread questions across the bab's
+    /// sections instead of piling them onto one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_section_id: Option<String>,
+
     /// Tingkat kesukaran + Bloom C1-C6 (HOTS derived, never stored).
     /// Optional so every question written before this existed still
     /// loads — see quiz_taxonomy.rs for why the two axes stay separate.
@@ -411,6 +428,104 @@ pub fn value_to_key(value: &Value) -> String {
         }
         other => other.to_string(),
     }
+}
+
+/// Fields that give the answer away. Everything a renderer needs to SHOW a
+/// question stays (stem, choices, word lists, syllables, `error_text` —
+/// error_correction highlights it on purpose); only what a scorer or a
+/// marker needs is removed.
+pub const ANSWER_KEY_FIELDS: &[&str] = &["answer", "answers", "explanation", "option_scores", "model_answer", "rubric", "stressed_index"];
+
+/// The shape a learner may receive. Until this existed `GET /module-items/{id}`
+/// sent `quiz_config` verbatim, so every answer key was one network tab
+/// away — shuffling choices meant nothing while the key sat in the response.
+/// Works on raw JSON rather than `QuizConfig` so fields this crate doesn't
+/// model (the struct's `extra` flatten) are stripped by the same rule and
+/// can never leak through a round-trip.
+pub fn learner_view(raw: &Value) -> Value {
+    let mut out = raw.clone();
+    if let Some(groups) = out.get_mut("question_groups").and_then(Value::as_array_mut) {
+        for group in groups {
+            if let Some(questions) = group.get_mut("questions").and_then(Value::as_array_mut) {
+                for question in questions.iter_mut().filter_map(Value::as_object_mut) {
+                    for field in ANSWER_KEY_FIELDS {
+                        question.remove(*field);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn has_combined_choice(text: &str) -> bool {
+    const PHRASES: &[&str] = &[
+        "semua benar", "semua jawaban benar", "semua pilihan benar", "semua salah", "semua jawaban salah",
+        "tidak ada yang benar", "tidak ada jawaban", "bukan salah satu", "all of the above", "none of the above",
+    ];
+    let lower = text.to_lowercase();
+    if PHRASES.iter().any(|p| lower.contains(p)) {
+        return true;
+    }
+    // "A dan C", "(1) dan (3)" style answers refer to OTHER choices by
+    // their letter; relettering after a shuffle would silently change
+    // what they mean. Short texts only — a real sentence that happens
+    // to contain "a" and "dan" is not a cross-reference.
+    let tokens: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()).collect();
+    if tokens.len() > 8 {
+        return false;
+    }
+    let letters = tokens.iter().filter(|t| matches!(**t, "a" | "b" | "c" | "d" | "e")).count();
+    let joined = tokens.iter().any(|t| matches!(*t, "dan" | "and" | "atau" | "or"));
+    (letters >= 2 && joined) || tokens.windows(2).any(|w| matches!(w[0], "pilihan" | "jawaban" | "opsi") && matches!(w[1], "a" | "b" | "c" | "d" | "e"))
+}
+
+/// A numeral as Indonesian content writes it: "$1.250$", "3,5", "-7".
+fn choice_number(text: &str) -> Option<f64> {
+    let cleaned: String = text.trim().trim_matches('$').chars().filter(|c| !c.is_whitespace()).collect();
+    if cleaned.is_empty() || !cleaned.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | ',' | '-')) {
+        return None;
+    }
+    cleaned.replace('.', "").replace(',', ".").parse().ok()
+}
+
+fn choices_are_monotonic_numbers(choices: &[LabeledOption]) -> bool {
+    if choices.len() < 3 {
+        return false;
+    }
+    let Some(values) = choices.iter().map(|c| choice_number(c.text())).collect::<Option<Vec<_>>>() else { return false };
+    values.windows(2).all(|w| w[0] < w[1]) || values.windows(2).all(|w| w[0] > w[1])
+}
+
+fn leans_on_previous_question(stem: &str) -> bool {
+    const PHRASES: &[&str] = &[
+        "soal sebelumnya", "soal nomor", "nomor sebelumnya", "jawaban sebelumnya", "soal di atas", "berdasarkan jawaban",
+        "pertanyaan sebelumnya", "previous question",
+    ];
+    let lower = stem.to_lowercase();
+    PHRASES.iter().any(|p| lower.contains(p))
+}
+
+/// Marks the questions a shuffled paper must leave alone. Deterministic
+/// and cheap, run on every save (author PATCH and AI merge) next to
+/// `ensure_question_uids`. Only ever sets a flag that is still `None`: an
+/// author who explicitly un-fixed a question keeps their `false`.
+/// Returns whether anything changed.
+pub fn detect_order_constraints(config: &mut QuizConfig) -> bool {
+    let mut changed = false;
+    for group in &mut config.question_groups {
+        for (index, question) in group.questions.iter_mut().enumerate() {
+            if question.choices_fixed.is_none() && (question.choices.iter().any(|c| has_combined_choice(c.text())) || choices_are_monotonic_numbers(&question.choices)) {
+                question.choices_fixed = Some(true);
+                changed = true;
+            }
+            if question.order_locked.is_none() && index > 0 && question.prompt_text().is_some_and(leans_on_previous_question) {
+                question.order_locked = Some(true);
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 /// P39-001 — gives every question in the deck a stable `uid`: assigns a
@@ -598,6 +713,13 @@ pub struct QuizSection {
     pub extra: serde_json::Map<String, Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuestionPool {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_item_id: Option<Uuid>,
+    pub draw_count: i64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QuizConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -665,6 +787,12 @@ pub struct QuizConfig {
     /// that group's questions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    /// Draw a fresh random subset per attempt instead of showing every
+    /// question — "Latihan 10 soal" and "Latihan 25 soal" drawing from
+    /// the bab's 50-question bank. `source_item_id` None = draw from this
+    /// item's own groups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_pool: Option<QuestionPool>,
     /// How many times a learner may attempt this quiz. `None`/absent =
     /// unlimited (today's behavior, unchanged). Phase 38.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -706,6 +834,67 @@ impl QuizConfig {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn mcq(stem: &str, choices: &[&str]) -> QuizQuestion {
+        QuizQuestion {
+            number: json!(1),
+            stem: Some(stem.into()),
+            choices: choices.iter().enumerate().map(|(i, t)| LabeledOption::Labeled { label: Some(((b'A' + i as u8) as char).to_string()), text: (*t).into(), image: None }).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn deck(questions: Vec<QuizQuestion>) -> QuizConfig {
+        QuizConfig { question_groups: vec![QuizQuestionGroup { group_id: "g".into(), r#type: "multiple_choice".into(), questions, ..Default::default() }], ..Default::default() }
+    }
+
+    #[test]
+    fn combined_and_cross_reference_choices_are_fixed() {
+        let mut config = deck(vec![
+            mcq("Mana yang benar?", &["$0$", "$1$", "Semua benar", "Tidak ada"]),
+            mcq("Pernyataan yang tepat?", &["(1) saja", "(2) saja", "A dan B", "B dan C"]),
+            mcq("Bilangan cacah terkecil?", &["Nol", "Satu", "Dua", "Tiga"]),
+        ]);
+        assert!(detect_order_constraints(&mut config));
+        let q = &config.question_groups[0].questions;
+        assert_eq!(q[0].choices_fixed, Some(true));
+        assert_eq!(q[1].choices_fixed, Some(true));
+        assert_eq!(q[2].choices_fixed, None, "ordinary word choices stay shuffleable");
+    }
+
+    #[test]
+    fn ascending_numbers_are_fixed_but_a_scrambled_set_is_not() {
+        let mut config = deck(vec![mcq("Berapa?", &["$1.200$", "$1.250$", "$2.000$", "$10.000$"]), mcq("Berapa?", &["$16$", "$28$", "$24$", "$32$"])]);
+        detect_order_constraints(&mut config);
+        let q = &config.question_groups[0].questions;
+        assert_eq!(q[0].choices_fixed, Some(true));
+        assert_eq!(q[1].choices_fixed, None);
+    }
+
+    #[test]
+    fn a_stem_leaning_on_the_previous_question_locks_order_and_an_explicit_false_survives() {
+        let mut config = deck(vec![mcq("Hitung $5 + 7$.", &["11", "12"]), mcq("Berdasarkan jawaban soal sebelumnya, kalikan dengan 2.", &["22", "24"])]);
+        config.question_groups[0].questions.push(QuizQuestion { order_locked: Some(false), ..mcq("Dari soal nomor 1, berapa?", &["1", "2"]) });
+        detect_order_constraints(&mut config);
+        let q = &config.question_groups[0].questions;
+        assert_eq!(q[0].order_locked, None, "the first question has nothing before it to lean on");
+        assert_eq!(q[1].order_locked, Some(true));
+        assert_eq!(q[2].order_locked, Some(false), "an author's explicit false is never overwritten");
+    }
+
+    #[test]
+    fn the_learner_view_drops_every_answer_key_but_keeps_what_renders() {
+        let raw = json!({"question_groups": [{"group_id": "g", "type": "multiple_choice", "questions": [
+            {"number": 1, "stem": "S", "choices": [{"label": "A", "text": "x"}], "answer": "A", "explanation": "E", "option_scores": {"A": 5}, "taxonomy": {"bloom": "c1"}}
+        ]}]});
+        let view = learner_view(&raw);
+        let q = &view["question_groups"][0]["questions"][0];
+        for field in ANSWER_KEY_FIELDS {
+            assert!(q.get(*field).is_none(), "{field} leaked");
+        }
+        assert_eq!(q["stem"], "S");
+        assert_eq!(q["choices"][0]["text"], "x");
+    }
 
     #[test]
     fn parses_a_group_of_many_questions_over_one_passage() {

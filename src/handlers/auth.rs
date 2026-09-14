@@ -1,4 +1,4 @@
-use axum::{extract::State, Extension, Json};
+use axum::{extract::State, http::HeaderMap, Extension, Json};
 use std::sync::Arc;
 
 use crate::errors::AppError;
@@ -6,16 +6,21 @@ use crate::extract::ValidatedJson;
 use crate::models::auth::AuthContext;
 use crate::models::requests::auth::{GoogleCallbackRequest, RefreshRequest};
 use crate::models::responses::auth::{LoginResponse, MeResponse, RefreshResponse};
-use crate::services::auth as auth_service;
+use crate::services::request_meta::MaybeConnectInfo;
+use crate::services::{auth as auth_service, request_meta};
 use crate::state::AppState;
 
 // POST /auth/google/callback
 pub async fn google_callback(
     State(state): State<Arc<AppState>>,
+    MaybeConnectInfo(addr): MaybeConnectInfo,
+    headers: HeaderMap,
     ValidatedJson(body): ValidatedJson<GoogleCallbackRequest>,
 ) -> Result<Json<LoginResponse>, AppError> {
+    let meta = request_meta::extract(&headers, addr.map(axum::extract::ConnectInfo).as_ref());
     let result =
-        auth_service::google_callback(&state.db, &state.google_verifier, &state.config, &body.id_token).await?;
+        auth_service::google_callback(&state.db, &state.google_verifier, &state.config, &body.id_token, &meta)
+            .await?;
     Ok(Json(result))
 }
 

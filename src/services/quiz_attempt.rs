@@ -54,6 +54,12 @@ pub struct QuizQuestionResult {
     /// and award partial credit, so these are not always 0 or 1.
     pub points_earned: f64,
     pub points_max: f64,
+    /// The answer key in the letters THIS paper showed, and the author's
+    /// explanation — returned only after submit. The learner never gets
+    /// either from `GET /module-items/{id}` any more (`learner_view`), so
+    /// the result card's "Pembahasan" comes from here.
+    pub correct_answer: Option<serde_json::Value>,
+    pub explanation: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -124,22 +130,51 @@ pub async fn submit_quiz_attempt(
     attempt_id: Uuid,
     answers: &HashMap<String, serde_json::Value>,
 ) -> Result<QuizSubmitResponse, AppError> {
-    require_permission(ctx, Resource::Attempt, Action::Submit)?;
     let attempt = assessment::load_submittable_attempt(pool, ctx, attempt_id).await?;
     let item_id = attempt.item_id.ok_or_else(|| AppError::Internal(anyhow::anyhow!("quiz attempt has no item_id")))?;
+    // A preview sitting (/belajar/{id}/preview) is graded exactly like a
+    // learner's, and that is all: it records no learning event, no
+    // completion, and goes through no proctoring — see migrations/0056.
+    let preview = attempt.is_preview;
+    if preview {
+        if !crate::services::assessment::can_preview(pool, ctx, item_id).await? {
+            return Err(AppError::ForbiddenWithCode("preview_not_allowed"));
+        }
+    } else {
+        require_permission(ctx, Resource::Attempt, Action::Submit)?;
+    }
     // A proctored quiz only accepts answers from a sitting that went
     // through its preflight.
-    let proctor_session = crate::services::item_proctor::session_for_submit(pool, ctx.user_id, item_id).await?;
+    let proctor_session = if preview { None } else { crate::services::item_proctor::session_for_submit(pool, ctx.user_id, item_id).await? };
 
     // P39-002 — `current_version` is read in the SAME query as the
     // `quiz_config` being scored, so the version recorded on this
     // attempt is unambiguously the one that was actually live at grading
     // time, not whatever a second, later query might see if the item
     // gets published again in between.
-    let item_row = sqlx::query!(r#"select quiz_config, current_version from module_items where id = $1"#, item_id)
+    // The paper this attempt was given (quiz_paper). None only for an
+    // attempt started before papers existed — graded the old way: every
+    // question, keys exactly as submitted.
+    let paper: Option<crate::services::quiz_paper::Paper> = sqlx::query_scalar!(r#"select paper from attempts where id = $1"#, attempt_id)
+        .fetch_one(pool)
+        .await?
+        .and_then(|v| serde_json::from_value(v).ok());
+    let source_item_id = paper.as_ref().map(|p| p.source_item_id).unwrap_or(item_id);
+    let on_paper: Option<std::collections::HashSet<Uuid>> = paper.as_ref().map(|p| p.questions.iter().map(|q| q.uid).collect());
+    let by_original = paper.as_ref().map(crate::services::quiz_paper::original_key_lookup).unwrap_or_default();
+    let translated;
+    let answers: &HashMap<String, serde_json::Value> = match &paper {
+        Some(p) => {
+            translated = crate::services::quiz_paper::translate_answers(p, answers);
+            &translated
+        }
+        None => answers,
+    };
+
+    let item_row = sqlx::query!(r#"select quiz_config, current_version from module_items where id = $1"#, source_item_id)
         .fetch_optional(pool)
         .await?
-        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("quiz item {} not found", item_id)))?;
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("quiz item {} not found", source_item_id)))?;
     let raw_config = item_row.quiz_config.ok_or_else(|| AppError::Internal(anyhow::anyhow!("quiz item {} has no quiz_config", item_id)))?;
     let content_version = item_row.current_version;
     let quiz: QuizConfig = quiz_config_schema::parse(&raw_config)?;
@@ -159,6 +194,11 @@ pub async fn submit_quiz_attempt(
         let Some(info) = quiz_subtype::find(subtype) else { continue };
 
         for question in &group.questions {
+            if let Some(uids) = &on_paper {
+                if !question.uid.is_some_and(|u| uids.contains(&u)) {
+                    continue;
+                }
+            }
             let key = question.key();
             let submitted = answers.get(&key).cloned().unwrap_or(serde_json::Value::Null);
             answers_snapshot.insert(key.clone(), submitted.clone());
@@ -187,9 +227,14 @@ pub async fn submit_quiz_attempt(
             points_possible += max;
             points_earned += earned;
 
+            let shown = by_original.get(&key).copied();
+            let correct_answer = question.answer.as_ref().map(|a| match shown {
+                Some(pq) => crate::services::quiz_paper::answer_as_shown(pq, a),
+                None => a.clone(),
+            });
             results.push(QuizQuestionResult {
                 group_id: group.group_id.clone(),
-                question_number: key,
+                question_number: shown.map(|pq| pq.shown_key.clone()).unwrap_or(key),
                 subtype: subtype.to_string(),
                 grading_mode: grading_mode_label(info.grading_mode),
                 correct,
@@ -197,8 +242,19 @@ pub async fn submit_quiz_attempt(
                 pending_review,
                 points_earned: earned,
                 points_max: max,
+                correct_answer,
+                explanation: question.explanation.as_deref().map(|text| match shown {
+                    Some(pq) => crate::services::quiz_paper::explanation_as_shown(pq, text),
+                    None => text.to_string(),
+                }),
             });
         }
+    }
+
+    // Results follow the order the learner saw, not the bank's order.
+    if let Some(p) = &paper {
+        let position: HashMap<&str, usize> = p.questions.iter().enumerate().map(|(i, q)| (q.shown_key.as_str(), i)).collect();
+        results.sort_by_key(|r| position.get(r.question_number.as_str()).copied().unwrap_or(usize::MAX));
     }
 
     let score = if points_possible > 0.0 { Some((points_earned / points_possible * 1000.0).round() / 10.0) } else { None };
@@ -216,6 +272,10 @@ pub async fn submit_quiz_attempt(
     .execute(pool)
     .await?;
 
+    if preview {
+        return Ok(QuizSubmitResponse { attempt_id, status: status.to_string(), score, results });
+    }
+
     // P39-004 (ADR-0013 L1) — a proctored/exam-monitored sitting is a
     // "tryout" in ADR-0013 §1.5's sense; everything else here is casual
     // "practice". Read before `close_session` below (Uuid is Copy, so
@@ -231,9 +291,13 @@ pub async fn submit_quiz_attempt(
     for group in &quiz.question_groups {
         for question in &group.questions {
             let Some(uid) = question.uid else { continue };
+            if on_paper.as_ref().is_some_and(|uids| !uids.contains(&uid)) {
+                continue;
+            }
             let key = question.key();
             let submitted = answers.get(&key).cloned().unwrap_or(serde_json::Value::Null);
-            let correct = results.iter().find(|r| r.question_number == key).and_then(|r| r.correct);
+            let result_key = by_original.get(&key).map(|pq| pq.shown_key.clone()).unwrap_or_else(|| key.clone());
+            let correct = results.iter().find(|r| r.question_number == result_key && r.group_id == group.group_id).and_then(|r| r.correct);
             let mut event = crate::services::learning_event::NewLearningEvent::server(
                 "question_answered",
                 "question",
@@ -258,6 +322,36 @@ pub async fn submit_quiz_attempt(
     submitted_event.module_item_id = Some(item_id);
     submitted_event.content_version = content_version;
     crate::services::learning_event::record(pool, ctx.user_id, crate::services::learning_event::EventChannel::Server, submitted_event).await?;
+
+    // Answer facts for heatmaps and statistics (migrations/0058): the same
+    // questions that just produced events, with their curriculum place
+    // and taxonomy snapshotted.
+    let mut facts = Vec::new();
+    for group in &quiz.question_groups {
+        for question in &group.questions {
+            let Some(uid) = question.uid else { continue };
+            if on_paper.as_ref().is_some_and(|uids| !uids.contains(&uid)) {
+                continue;
+            }
+            let key = question.key();
+            let result_key = by_original.get(&key).map(|pq| pq.shown_key.clone()).unwrap_or_else(|| key.clone());
+            let Some(result) = results.iter().find(|r| r.question_number == result_key && r.group_id == group.group_id) else { continue };
+            let (difficulty, bloom) = crate::services::answer_facts::taxonomy_labels(question);
+            facts.push(crate::services::answer_facts::FactInput {
+                question_uid: uid,
+                content_item_id: source_item_id,
+                source_section_id: question.source_section_id.clone(),
+                subtype: group.r#type.clone(),
+                difficulty,
+                bloom,
+                correct: if result.pending_review { None } else { result.correct.or(result.score.map(|s| s >= 50.0)) },
+                points_earned: result.points_earned,
+                points_max: result.points_max,
+                content_version,
+            });
+        }
+    }
+    crate::services::answer_facts::record(pool, ctx.user_id, item_id, source, Some(attempt_id), facts).await?;
 
     // What the access gates read. A score still waiting on a teacher is
     // recorded once graded (grade_manual_group).
@@ -351,7 +445,7 @@ pub async fn list_pending_reviews(pool: &PgPool, ctx: &AuthContext, item_id: Uui
     let attempts = sqlx::query_as!(
         Row,
         r#"select a.id, a.user_id, a.answers, a.submitted_at, a.question_snapshot
-           from attempts a where a.item_id = $1 and a.status = 'submitted'"#,
+           from attempts a where a.item_id = $1 and a.status = 'submitted' and not a.is_preview"#,
         item_id,
     )
     .fetch_all(pool)

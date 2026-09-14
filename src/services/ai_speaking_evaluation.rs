@@ -144,7 +144,7 @@ pub async fn run_speaking_evaluation(
     let (system_prompt, user_prompt) = speaking_evaluation_prompt(&transcript);
     let model = &eval_model.model_id;
     let max_tokens = resolve_max_tokens(pool, model, 1024).await;
-    let generation = match text_ai.generate(GenerationRequest { model: model.clone(), system_prompt, user_prompt, temperature: 0.3, max_tokens, image_url: None, json_mode: true }).await {
+    let generation = match text_ai.generate(GenerationRequest { model: model.clone(), system_prompt, user_prompt, temperature: 0.3, max_tokens, image_url: None, json_mode: true, thinking_budget: None, allow_partial: false }).await {
         Ok(g) => g,
         Err(e) => {
             tracing::warn!(error = ?e, "speaking evaluation generation failed");

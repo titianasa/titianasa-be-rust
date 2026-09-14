@@ -250,7 +250,8 @@ pub async fn delete(pool: &PgPool, ctx: &AuthContext, id: Uuid) -> Result<(), Ap
              select m.id from modules m join subtree s on m.parent_id = s.id
            )
            select count(*) as "n!" from attempts a
-           where a.item_id in (select i.id from module_items i where i.module_id in (select id from subtree))"#,
+           where not a.is_preview
+             and a.item_id in (select i.id from module_items i where i.module_id in (select id from subtree))"#,
         id,
     )
     .fetch_one(pool)
@@ -263,6 +264,23 @@ pub async fn delete(pool: &PgPool, ctx: &AuthContext, id: Uuid) -> Result<(), Ap
             ),
         ));
     }
+
+    // Previews are not learner history (migrations/0056) — cleared first
+    // so they never block the delete below.
+    let item_ids: Vec<Uuid> = sqlx::query_scalar!(
+        r#"with recursive subtree as (
+             select id from modules where id = $1
+             union all
+             select m.id from modules m join subtree s on m.parent_id = s.id
+           )
+           select i.id from module_items i where i.module_id in (select id from subtree)"#,
+        id,
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut tx = pool.begin().await?;
+    crate::services::assessment::purge_preview_attempts(&mut tx, &item_ids).await?;
+    tx.commit().await?;
 
     sqlx::query!(
         r#"with recursive subtree as (

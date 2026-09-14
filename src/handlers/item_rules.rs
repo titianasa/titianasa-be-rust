@@ -14,7 +14,7 @@ use crate::models::requests::module::{ProctorConfigRequest, SetApprovalRequest, 
 use crate::services::item_proctor::{self, EventRequest, ItemProctorConfigResponse, SessionEvent, SessionState, SessionSummary, StartSessionRequest};
 use crate::services::item_progress::{self, ProgressRow};
 use crate::services::permissions::{require_permission, Action, Resource};
-use crate::services::{item_guard, module_item, org_class, org_class_session};
+use crate::services::{item_guard, module_item, org_class, org_class_session, section_checkpoint};
 use crate::state::AppState;
 
 // The module builder's per-item rules: access gates, attendance guards,
@@ -54,8 +54,78 @@ pub async fn post_complete(State(state): State<Arc<AppState>>, Extension(ctx): E
     if item.content_type.as_deref() != Some("article") {
         return Err(AppError::UnprocessableEntity("not_an_article", "kuis selesai saat dikumpulkan, bukan lewat tombol ini".to_string()));
     }
+    // An article with checkpoints is finished by passing them, not by a
+    // button — otherwise "Selesai" would skip every comprehension check
+    // and still open the Latihan.
+    if !section_checkpoint::completion_allowed(&state.db, ctx.user_id, item_id).await? {
+        return Err(AppError::UnprocessableEntity("checkpoints_incomplete", "selesaikan semua checkpoint di modul ini dulu".to_string()));
+    }
     item_progress::record_completion(&state.db, ctx.user_id, item_id, None, "self_learning").await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct CheckpointAnswersRequest {
+    #[serde(default)]
+    pub answers: std::collections::HashMap<String, Value>,
+}
+
+// GET /module-items/{id}/checkpoints
+pub async fn get_checkpoints(State(state): State<Arc<AppState>>, Extension(ctx): Extension<AuthContext>, Path(item_id): Path<Uuid>) -> Result<Json<section_checkpoint::CheckpointsResponse>, AppError> {
+    Ok(Json(section_checkpoint::state(&state.db, &ctx, item_id).await?))
+}
+
+// POST /module-items/{id}/sections/{section_id}/checkpoint
+pub async fn post_checkpoint(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
+    Path((item_id, section_id)): Path<(Uuid, String)>,
+    Json(body): Json<CheckpointAnswersRequest>,
+) -> Result<Json<section_checkpoint::CheckpointSubmitResponse>, AppError> {
+    Ok(Json(section_checkpoint::submit(&state.db, &ctx, item_id, &section_id, &body.answers).await?))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct CheckpointPreviewRequest {
+    /// The previous preview draw, so "Soal lain" leans to unseen questions.
+    #[serde(default)]
+    pub previous: Option<Value>,
+}
+
+// POST /module-items/{id}/sections/{section_id}/checkpoint/preview
+pub async fn post_checkpoint_preview(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
+    Path((item_id, section_id)): Path<(Uuid, String)>,
+    Json(body): Json<CheckpointPreviewRequest>,
+) -> Result<Json<section_checkpoint::CheckpointPreviewDraw>, AppError> {
+    Ok(Json(section_checkpoint::preview_draw(&state.db, &ctx, item_id, &section_id, body.previous.as_ref()).await?))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct CheckpointPreviewGradeRequest {
+    pub draw: crate::services::quiz_paper::Paper,
+    #[serde(default)]
+    pub answers: std::collections::HashMap<String, Value>,
+}
+
+// POST /module-items/{id}/sections/{section_id}/checkpoint/preview/grade
+pub async fn post_checkpoint_preview_grade(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
+    Path((item_id, section_id)): Path<(Uuid, String)>,
+    Json(body): Json<CheckpointPreviewGradeRequest>,
+) -> Result<Json<section_checkpoint::CheckpointSubmitResponse>, AppError> {
+    Ok(Json(section_checkpoint::preview_grade(&state.db, &ctx, item_id, &section_id, &body.draw, &body.answers).await?))
+}
+
+// POST /module-items/{id}/sections/{section_id}/reread
+pub async fn post_checkpoint_reread(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
+    Path((item_id, section_id)): Path<(Uuid, String)>,
+) -> Result<Json<section_checkpoint::CheckpointsResponse>, AppError> {
+    Ok(Json(section_checkpoint::reread(&state.db, &ctx, item_id, &section_id).await?))
 }
 
 // GET /module-items/{id}/progress

@@ -346,13 +346,25 @@ fn month_bounds(year: i32, month: u32) -> (chrono::NaiveDate, chrono::NaiveDate)
 /// year/month, never from caller input, so there's no injection surface
 /// despite the `format!`.
 pub async fn ensure_current_partitions(pool: &PgPool) -> Result<(), AppError> {
+    ensure_month_partitions(pool, "learning_events").await
+}
+
+/// The monthly-partitioned tables this safety net may touch. A fixed
+/// list, never caller input — the name is spliced into DDL.
+const MONTH_PARTITIONED: [&str; 2] = ["learning_events", "question_answer_facts"];
+
+/// Current and next month's partition for one of `MONTH_PARTITIONED`.
+pub async fn ensure_month_partitions(pool: &PgPool, parent: &str) -> Result<(), AppError> {
     use chrono::Datelike;
+    let Some(parent) = MONTH_PARTITIONED.iter().find(|t| **t == parent) else {
+        return Err(AppError::Internal(anyhow::anyhow!("{parent} is not a monthly-partitioned table")));
+    };
     let now = chrono::Utc::now();
     let (mut year, mut month) = (now.year(), now.month());
     for _ in 0..2 {
         let (start, end) = month_bounds(year, month);
-        let table_name = format!("learning_events_{year:04}_{month:02}");
-        let sql = format!(r#"create table if not exists {table_name} partition of learning_events for values from ('{start}') to ('{end}')"#);
+        let table_name = format!("{parent}_{year:04}_{month:02}");
+        let sql = format!(r#"create table if not exists {table_name} partition of {parent} for values from ('{start}') to ('{end}')"#);
         sqlx::query(&sql).execute(pool).await.map_err(|e| AppError::Internal(e.into()))?;
         (year, month) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
     }

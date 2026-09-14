@@ -55,6 +55,11 @@ pub struct ChatTurnRequest {
     pub message: String,
     #[serde(default)]
     pub history: Vec<ChatHistoryEntry>,
+    /// Sent from /belajar/{id}/preview. The tutor answers the same way,
+    /// but an author trying the chat out is not a learner asking — the
+    /// turn is not recorded as a learning event.
+    #[serde(default)]
+    pub preview: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -174,7 +179,9 @@ pub async fn generate_turn(pool: &PgPool, ai: &dyn AIProvider, model: &str, ctx:
     }
     let section_index = req.section_index.min(plan.sections.len() - 1);
 
-    record_question_event(pool, ctx.user_id, req.item_id, &plan, section_index, message).await;
+    if !req.preview {
+        record_question_event(pool, ctx.user_id, req.item_id, &plan, section_index, message).await;
+    }
 
     let ai_task_id = Uuid::new_v4();
     let max_tokens = resolve_max_tokens(pool, model, 900).await;
@@ -186,6 +193,7 @@ pub async fn generate_turn(pool: &PgPool, ai: &dyn AIProvider, model: &str, ctx:
         max_tokens,
         image_url: None,
         json_mode: false,
+        thinking_budget: None, allow_partial: false,
     };
 
     // One retry on the SAME provider — a transient hiccup is worth one
@@ -254,7 +262,9 @@ pub async fn generate_turn_stream(
     }
     let section_index = req.section_index.min(plan.sections.len() - 1);
 
-    record_question_event(&pool, ctx.user_id, req.item_id, &plan, section_index, &message).await;
+    if !req.preview {
+        record_question_event(&pool, ctx.user_id, req.item_id, &plan, section_index, &message).await;
+    }
 
     let ai_task_id = Uuid::new_v4();
     let max_tokens = resolve_max_tokens(&pool, &model, 900).await;
@@ -266,6 +276,7 @@ pub async fn generate_turn_stream(
         max_tokens,
         image_url: None,
         json_mode: false,
+        thinking_budget: None, allow_partial: false,
     };
 
     let inner = ai.generate_stream(request).await.map_err(|e| {
@@ -336,8 +347,8 @@ mod tests {
             level: "SMA".to_string(),
             language: "id".to_string(),
             sections: vec![
-                lesson_plan::LessonPlanSection { id: "a".into(), title: "Pengantar".into(), minutes: Some(5), goal: "Paham definisi".into(), content: "Gerak lurus adalah...".into() },
-                lesson_plan::LessonPlanSection { id: "b".into(), title: "Rumus".into(), minutes: Some(5), goal: String::new(), content: "v = s/t".into() },
+                lesson_plan::LessonPlanSection { id: "a".into(), title: "Pengantar".into(), minutes: Some(5), goal: "Paham definisi".into(), content: "Gerak lurus adalah...".into(), checkpoint: None },
+                lesson_plan::LessonPlanSection { id: "b".into(), title: "Rumus".into(), minutes: Some(5), goal: String::new(), content: "v = s/t".into(), checkpoint: None },
             ],
         })
         .unwrap()

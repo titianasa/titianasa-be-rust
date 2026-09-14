@@ -245,16 +245,62 @@ fn image_syntax(line: &str) -> Option<(String, String)> {
 
 fn parse_key_value_body(lines: &[&str]) -> serde_json::Value {
     let mut map = BTreeMap::new();
-    for line in lines {
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = lines[i];
+        i += 1;
         if line.trim().is_empty() {
             continue;
         }
         let Some(colon_index) = line.find(':') else { continue };
         let key = line[..colon_index].trim().to_string();
-        let value = line[colon_index + 1..].trim();
-        map.insert(key, parse_scalar(value));
+        let mut value = line[colon_index + 1..].trim().to_string();
+        // A JSON value the writer spread over several lines. The guide
+        // asks for one line per key, but models pretty-print arrays
+        // anyway, and a `rows: [` read on its own becomes the string
+        // "[" — the block then fails its schema and is demoted, which
+        // is how raw JSON ends up rendered as prose to a learner.
+        if unbalanced(&value) {
+            while i < lines.len() && unbalanced(&value) {
+                value.push(' ');
+                value.push_str(lines[i].trim());
+                i += 1;
+            }
+        }
+        map.insert(key, parse_scalar(&value));
     }
     serde_json::to_value(map).unwrap()
+}
+
+/// True while `value` has an open bracket or brace outside a string.
+/// Only opened values are continued, so prose with a stray "]" is
+/// untouched.
+fn unbalanced(value: &str) -> bool {
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut opened = false;
+    for ch in value.chars() {
+        if in_string {
+            match ch {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '[' | '{' => {
+                depth += 1;
+                opened = true;
+            }
+            ']' | '}' => depth -= 1,
+            _ => {}
+        }
+    }
+    opened && (depth > 0 || in_string)
 }
 
 // A directive field is usually a plain string, but the structured blocks
@@ -279,6 +325,29 @@ mod tests {
 
     fn types(source: &str) -> Vec<String> {
         parse(source).unwrap().iter().map(|b| b.r#type.clone()).collect()
+    }
+
+    #[test]
+    fn json_value_spread_over_several_lines_is_one_value() {
+        // Models pretty-print `rows` no matter what the guide says.
+        // Read line by line, `rows` became the string "[" — the table
+        // then failed its schema and was demoted, so the learner saw
+        // the raw JSON as prose.
+        let blocks = parse(":::table\nheaders: [\"A\", \"B\"]\nrows: [\n  [\"1\", \"2\"],\n  [\"3\", \"4\"]\n]\n:::").unwrap();
+        assert_eq!(blocks[0].data["rows"], json!([["1", "2"], ["3", "4"]]));
+    }
+
+    #[test]
+    fn a_bracket_inside_prose_does_not_swallow_the_next_lines() {
+        let blocks = parse(":::callout\ntext: Tulis [di sini] lalu berhenti.\nvariant: tip\n:::").unwrap();
+        assert_eq!(blocks[0].data["text"], json!("Tulis [di sini] lalu berhenti."));
+        assert_eq!(blocks[0].data["variant"], json!("tip"));
+    }
+
+    #[test]
+    fn a_bracket_inside_a_json_string_does_not_end_the_value() {
+        let blocks = parse(":::steps\nitems: [\n  \"Kurung ] di dalam teks\",\n  \"Langkah dua\"\n]\n:::").unwrap();
+        assert_eq!(blocks[0].data["items"], json!(["Kurung ] di dalam teks", "Langkah dua"]));
     }
 
     #[test]

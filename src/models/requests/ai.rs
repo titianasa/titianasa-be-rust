@@ -80,6 +80,27 @@ pub struct GenerateQuizGroupRequest {
     /// author is looking straight at the result.
     #[serde(default)]
     pub mark_draft: bool,
+    /// Exactly what each question in this batch must be — one entry per
+    /// question. Set by the bank filler, which plans the whole 50-question
+    /// blueprint itself and asks for the slots still missing, so chunking
+    /// a bank into small calls doesn't give every chunk its own rounded
+    /// quota. Overrides the automatic "TARGET SEBARAN" block.
+    #[serde(default)]
+    pub slots: Vec<QuestionSlotRequest>,
+    /// Restrict the referenced Modul Belajar to ONE of its sections — a
+    /// much smaller prompt than the whole article, and questions that
+    /// actually test that section.
+    pub reference_section_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct QuestionSlotRequest {
+    /// "c1".."c6"
+    pub bloom: String,
+    /// "mudah" | "sedang" | "sulit"
+    pub difficulty: String,
+    /// The Modul Belajar section this question should come from.
+    pub section_id: Option<String>,
 }
 
 fn default_count() -> i64 {

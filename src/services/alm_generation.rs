@@ -78,6 +78,7 @@ pub async fn generate_fragment(pool: &PgPool, ai: &dyn AIProvider, model: &str, 
         max_tokens,
         image_url: None,
         json_mode: false,
+        thinking_budget: None, allow_partial: false,
     };
 
     // One retry on the SAME provider — never falls back to a different
